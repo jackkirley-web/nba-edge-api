@@ -1,138 +1,57 @@
-# injury_report.py — Official NBA Injury Report scraper
-# Pulls from the official PDF: official.nba.com/nba-injury-report-2025-26-season/
-# Also falls back to ESPN public API
+# injury_report.py — ESPN injuries (reliable) + NBA official page scrape
+# Removed PDF parsing — the PDF link on NBA.com points to rulebook not injury report
 
 import logging
-import re
 import requests
+import re
 from datetime import date
-from typing import Optional
-import io
 
 logger = logging.getLogger(__name__)
 
-# Official NBA injury report PDF index page
-NBA_INJURY_PDF_INDEX = "https://official.nba.com/nba-injury-report-2025-26-season/"
-NBA_INJURY_PDF_BASE = "https://official.nba.com"
-
-# ESPN fallback
 ESPN_INJURIES = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
+NBA_INJURY_PAGE = "https://official.nba.com/nba-injury-report-2025-26-season/"
 
 STATUS_MAP = {
     "Out": "Out",
-    "Doubtful": "Doubtful",
+    "Doubtful": "Doubtful", 
     "Questionable": "Questionable",
     "Probable": "Probable",
     "Available": "Available",
-    "GTD": "Questionable",  # Game-Time Decision
+    "Game Time Decision": "Questionable",
 }
 
 
 def fetch_official_injury_report() -> dict:
     """
-    Attempt to fetch and parse the official NBA injury report PDF.
-    Falls back to ESPN if PDF parsing fails.
-
-    Returns dict: { "Team Name": [ { name, status, reason, current_status } ] }
+    Fetch injury data. Tries ESPN first (most reliable),
+    then attempts to scrape NBA official page as supplement.
     """
+    injuries = _fetch_espn_injuries()
+    
+    # Try to supplement with NBA official page (HTML scrape, no PDF)
     try:
-        return _fetch_pdf_report()
+        nba_injuries = _scrape_nba_injury_page()
+        # Merge — NBA official takes priority for status
+        for team, players in nba_injuries.items():
+            if team not in injuries:
+                injuries[team] = players
+            else:
+                # Add any players not already in ESPN data
+                existing_names = {p["name"].lower() for p in injuries[team]}
+                for p in players:
+                    if p["name"].lower() not in existing_names:
+                        injuries[team].append(p)
     except Exception as e:
-        logger.warning(f"PDF injury report failed ({e}), falling back to ESPN")
-        return _fetch_espn_injuries()
+        logger.warning(f"NBA official page scrape failed (ESPN data used): {e}")
 
-
-def _fetch_pdf_report() -> dict:
-    """
-    Fetch the latest injury report PDF from official.nba.com and parse it.
-    The PDF lists: Team | Player | Current Status | Reason
-    """
-    # Step 1: Find the latest PDF link on the page
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; NBAEdge/2.0)",
-        "Accept": "text/html,application/xhtml+xml",
-    }
-    resp = requests.get(NBA_INJURY_PDF_INDEX, headers=headers, timeout=15)
-    resp.raise_for_status()
-
-    # Find PDF links in the page HTML
-    pdf_links = re.findall(r'href="([^"]+\.pdf)"', resp.text)
-    if not pdf_links:
-        # Try finding links with different format
-        pdf_links = re.findall(r'"(https?://[^"]+Injury[^"]+\.pdf)"', resp.text, re.IGNORECASE)
-
-    if not pdf_links:
-        raise ValueError("No PDF links found on NBA injury report page")
-
-    # Get the most recent PDF (usually the last one listed or first)
-    pdf_url = pdf_links[0]
-    if not pdf_url.startswith("http"):
-        pdf_url = NBA_INJURY_PDF_BASE + pdf_url
-
-    logger.info(f"Fetching injury PDF: {pdf_url}")
-
-    # Step 2: Download PDF
-    pdf_resp = requests.get(pdf_url, headers=headers, timeout=20)
-    pdf_resp.raise_for_status()
-
-    # Step 3: Parse PDF with pdfplumber
-    import pdfplumber
-    injuries = {}
-
-    with pdfplumber.open(io.BytesIO(pdf_resp.content)) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables()
-            for table in tables:
-                for row in table:
-                    if not row or len(row) < 4:
-                        continue
-                    # Expected columns: Game Date | Game Time | Matchup | Team | Player | Status | Reason
-                    # OR: Team | Player | Current Status | Reason (older format)
-                    row = [str(c).strip() if c else "" for c in row]
-
-                    # Skip header rows
-                    if any(h in row[0].lower() for h in ["team", "game", "date"]):
-                        continue
-
-                    # Try to identify team + player + status columns
-                    team = _clean_team_name(row[0])
-                    if not team:
-                        continue
-
-                    player = row[1] if len(row) > 1 else ""
-                    status_raw = row[2] if len(row) > 2 else ""
-                    reason = row[3] if len(row) > 3 else ""
-
-                    # Sometimes format is: GameDate | GameTime | Matchup | Team | Player | Status | Reason
-                    if len(row) >= 7 and _looks_like_date(row[0]):
-                        team = _clean_team_name(row[3])
-                        player = row[4] if len(row) > 4 else ""
-                        status_raw = row[5] if len(row) > 5 else ""
-                        reason = row[6] if len(row) > 6 else ""
-
-                    if not player or not status_raw:
-                        continue
-
-                    status = STATUS_MAP.get(status_raw, status_raw)
-
-                    if team not in injuries:
-                        injuries[team] = []
-
-                    injuries[team].append({
-                        "name": player,
-                        "status": status,
-                        "reason": reason,
-                        "source": "NBA Official",
-                    })
-
-    logger.info(f"Parsed {sum(len(v) for v in injuries.values())} injury entries from PDF")
     return injuries
 
 
 def _fetch_espn_injuries() -> dict:
-    """ESPN public injuries API fallback."""
+    """ESPN public injuries API — most reliable free source."""
     try:
-        resp = requests.get(ESPN_INJURIES, timeout=10)
+        resp = requests.get(ESPN_INJURIES, timeout=10,
+                           headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
         data = resp.json()
         injuries = {}
@@ -142,66 +61,104 @@ def _fetch_espn_injuries() -> dict:
                 continue
             injuries[team_name] = []
             for inj in team_data.get("injuries", []):
+                status_raw = inj.get("status", "Questionable")
                 injuries[team_name].append({
                     "name": inj.get("athlete", {}).get("displayName", "Unknown"),
-                    "status": inj.get("status", "Questionable"),
+                    "status": STATUS_MAP.get(status_raw, status_raw),
                     "reason": inj.get("details", {}).get("detail", ""),
                     "position": inj.get("athlete", {}).get("position", {}).get("abbreviation", ""),
                     "source": "ESPN",
                 })
-        logger.info(f"ESPN injuries: {sum(len(v) for v in injuries.values())} entries")
+        logger.info(f"ESPN injuries: {sum(len(v) for v in injuries.values())} players across {len(injuries)} teams")
         return injuries
     except Exception as e:
-        logger.error(f"ESPN injuries also failed: {e}")
+        logger.error(f"ESPN injuries failed: {e}")
         return {}
 
 
-def _clean_team_name(raw: str) -> Optional[str]:
-    """Attempt to clean up a team name string from the PDF."""
-    if not raw or len(raw) < 3:
-        return None
-    # Remove common noise
-    clean = raw.strip().replace("\n", " ").replace("  ", " ")
-    # Skip obviously wrong values
-    if any(skip in clean.lower() for skip in ["status", "player", "game", "date", "time", "reason"]):
-        return None
-    return clean
+def _scrape_nba_injury_page() -> dict:
+    """
+    Scrape the NBA official injury report HTML page.
+    The page has a table with: Team | Player | Current Status | Reason
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; NBAEdge/2.0)"}
+    resp = requests.get(NBA_INJURY_PAGE, headers=headers, timeout=15)
+    resp.raise_for_status()
+    
+    injuries = {}
+    html = resp.text
+    
+    # Find table rows in the injury report
+    # NBA injury page uses a specific table structure
+    rows = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
+    
+    for row in rows:
+        cells = re.findall(r'<td[^>]*>(.*?)</td>', row, re.DOTALL | re.IGNORECASE)
+        # Clean HTML tags from cells
+        cells = [re.sub(r'<[^>]+>', '', c).strip() for c in cells]
+        cells = [c for c in cells if c]  # Remove empty
+        
+        if len(cells) >= 3:
+            # Try to identify team/player/status pattern
+            # Format varies but usually: Date | Time | Matchup | Team | Player | Status | Reason
+            # or: Team | Player | Status | Reason
+            for i, cell in enumerate(cells):
+                if _is_nba_team(cell) and i + 2 < len(cells):
+                    team = cell
+                    player = cells[i+1] if i+1 < len(cells) else ""
+                    status_raw = cells[i+2] if i+2 < len(cells) else ""
+                    reason = cells[i+3] if i+3 < len(cells) else ""
+                    
+                    if player and status_raw and status_raw in STATUS_MAP:
+                        if team not in injuries:
+                            injuries[team] = []
+                        injuries[team].append({
+                            "name": player,
+                            "status": STATUS_MAP[status_raw],
+                            "reason": reason,
+                            "source": "NBA Official",
+                        })
+                    break
+    
+    logger.info(f"NBA official page: {sum(len(v) for v in injuries.values())} entries")
+    return injuries
 
 
-def _looks_like_date(val: str) -> bool:
-    """Check if a string looks like a date."""
-    return bool(re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", val.strip()))
+NBA_TEAMS = {
+    "Atlanta Hawks", "Boston Celtics", "Brooklyn Nets", "Charlotte Hornets",
+    "Chicago Bulls", "Cleveland Cavaliers", "Dallas Mavericks", "Denver Nuggets",
+    "Detroit Pistons", "Golden State Warriors", "Houston Rockets", "Indiana Pacers",
+    "Los Angeles Clippers", "Los Angeles Lakers", "Memphis Grizzlies", "Miami Heat",
+    "Milwaukee Bucks", "Minnesota Timberwolves", "New Orleans Pelicans", "New York Knicks",
+    "Oklahoma City Thunder", "Orlando Magic", "Philadelphia 76ers", "Phoenix Suns",
+    "Portland Trail Blazers", "Sacramento Kings", "San Antonio Spurs", "Toronto Raptors",
+    "Utah Jazz", "Washington Wizards",
+}
+
+def _is_nba_team(name: str) -> bool:
+    return name in NBA_TEAMS
 
 
 def get_injury_impact_score(injuries: list, team_players: list) -> dict:
-    """
-    Calculate how much a team's injuries affect their scoring.
-    
-    Weights injury impact by the player's usage rate and role.
-    Returns:
-      - total_usage_lost: sum of usage rates of Out players
-      - key_player_out: bool (starter-caliber player out)
-      - injury_severity: 0-10 score
-    """
+    """Calculate usage-weighted injury impact score."""
     out_players = {p["name"].lower() for p in injuries if p["status"] == "Out"}
-    ques_players = {p["name"].lower() for p in injuries if p["status"] in ("Questionable", "Doubtful", "GTD")}
+    ques_players = {p["name"].lower() for p in injuries if p["status"] in ("Questionable", "Doubtful")}
 
     total_usage_lost = 0.0
     key_player_out = False
     severity = 0
 
     for player in team_players:
-        name_lower = player["name"].lower()
+        name_lower = player.get("name", "").lower()
         usage = player.get("usage_rate", 0)
 
         if name_lower in out_players:
             total_usage_lost += usage
-            severity += usage * 10  # High-usage player out = high severity
-            if usage >= 0.20:  # 20%+ usage = key player
+            severity += usage * 10
+            if usage >= 0.20:
                 key_player_out = True
-
         elif name_lower in ques_players:
-            total_usage_lost += usage * 0.3  # 30% impact if questionable
+            total_usage_lost += usage * 0.3
             severity += usage * 3
 
     return {
