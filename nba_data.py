@@ -1,39 +1,26 @@
-# nba_data.py — Deep NBA.com data fetcher
-# Uses nba_api to pull the same data NBA front offices use
+# nba_data.py — Fixed parameter names for current nba_api version
 
 import logging
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from typing import Optional
-import requests
 
 logger = logging.getLogger(__name__)
 
-# nba_api imports — all free, direct from NBA.com
 from nba_api.stats.endpoints import (
     leaguegamefinder,
     teamgamelogs,
     leaguedashteamstats,
     leaguedashplayerstats,
-    playergamelogs,
-    scoreboardv2,
-    boxscoresummaryv2,
-    leaguedashlineups,
-    teamvsplayer,
-    leaguedashptteamdefend,
 )
-from nba_api.stats.static import teams as static_teams
 from nba_api.live.nba.endpoints import scoreboard as live_scoreboard
 
-# NBA.com rate limits — be respectful
-SLEEP_BETWEEN_CALLS = 0.7  # seconds
-
+SLEEP_BETWEEN_CALLS = 1.0
 CURRENT_SEASON = "2024-25"
 SEASON_TYPE = "Regular Season"
 
 
 def safe_call(fn, *args, retries=3, **kwargs):
-    """Call an nba_api endpoint with retry logic."""
     for attempt in range(retries):
         try:
             time.sleep(SLEEP_BETWEEN_CALLS)
@@ -45,16 +32,7 @@ def safe_call(fn, *args, retries=3, **kwargs):
     return None
 
 
-def get_all_teams():
-    """Return static team list with IDs and abbreviations."""
-    return {t["abbreviation"]: t for t in static_teams.get_teams()}
-
-
 def get_today_games():
-    """
-    Get today's scheduled games from the live scoreboard.
-    Returns list of game dicts with team IDs, names, status.
-    """
     try:
         sb = live_scoreboard.ScoreBoard()
         data = sb.get_dict()
@@ -83,11 +61,72 @@ def get_today_games():
         return []
 
 
+def get_team_advanced_stats():
+    """Get league-wide advanced stats. Uses per_mode_detailed (fixed)."""
+    result = safe_call(
+        leaguedashteamstats.LeagueDashTeamStats,
+        season=CURRENT_SEASON,
+        season_type_all_star=SEASON_TYPE,
+        measure_type_detailed_defense="Advanced",
+        per_mode_detailed="PerGame",
+    )
+    if not result:
+        return {}
+    try:
+        df = result.get_data_frames()[0]
+        stats = {}
+        for _, row in df.iterrows():
+            team_id = int(row.get("TEAM_ID", 0))
+            stats[team_id] = {
+                "team_name": row.get("TEAM_NAME"),
+                "off_rating": float(row.get("OFF_RATING", 110) or 110),
+                "def_rating": float(row.get("DEF_RATING", 110) or 110),
+                "net_rating": float(row.get("NET_RATING", 0) or 0),
+                "pace": float(row.get("PACE", 100) or 100),
+                "ts_pct": float(row.get("TS_PCT", 0.55) or 0.55),
+                "wins": int(row.get("W", 0) or 0),
+                "losses": int(row.get("L", 0) or 0),
+            }
+        logger.info(f"Got advanced stats for {len(stats)} teams")
+        return stats
+    except Exception as e:
+        logger.warning(f"get_team_advanced_stats parse failed: {e}")
+        return {}
+
+
+def get_team_recent_stats(team_id: int, last_n: int = 10):
+    result = safe_call(
+        leaguedashteamstats.LeagueDashTeamStats,
+        season=CURRENT_SEASON,
+        season_type_all_star=SEASON_TYPE,
+        measure_type_detailed_defense="Base",
+        per_mode_detailed="PerGame",
+        last_n_games=last_n,
+        team_id_nullable=team_id,
+    )
+    if not result:
+        return {}
+    try:
+        df = result.get_data_frames()[0]
+        if df.empty:
+            return {}
+        row = df.iloc[0]
+        return {
+            "pts": float(row.get("PTS", 0) or 0),
+            "fg_pct": float(row.get("FG_PCT", 0) or 0),
+            "three_pct": float(row.get("FG3_PCT", 0) or 0),
+            "rebounds": float(row.get("REB", 0) or 0),
+            "assists": float(row.get("AST", 0) or 0),
+            "turnovers": float(row.get("TOV", 0) or 0),
+            "wins": int(row.get("W", 0) or 0),
+            "losses": int(row.get("L", 0) or 0),
+        }
+    except Exception as e:
+        logger.warning(f"get_team_recent_stats failed: {e}")
+        return {}
+
+
 def get_team_game_logs(team_id: int, last_n: int = 15):
-    """
-    Get last N game logs for a team.
-    Returns list with pts, opp_pts, pace, off_rating, def_rating, etc.
-    """
     result = safe_call(
         teamgamelogs.TeamGameLogs,
         team_id_nullable=team_id,
@@ -97,115 +136,31 @@ def get_team_game_logs(team_id: int, last_n: int = 15):
     )
     if not result:
         return []
-
-    df = result.get_data_frames()[0]
-    if df.empty:
+    try:
+        df = result.get_data_frames()[0]
+        games = []
+        for _, row in df.iterrows():
+            games.append({
+                "game_id": row.get("GAME_ID"),
+                "game_date": str(row.get("GAME_DATE", "")),
+                "is_home": "vs." in str(row.get("MATCHUP", "")),
+                "win": row.get("WL", "") == "W",
+                "points": int(row.get("PTS", 0) or 0),
+                "fg_pct": float(row.get("FG_PCT", 0) or 0),
+                "rebounds": int(row.get("REB", 0) or 0),
+                "assists": int(row.get("AST", 0) or 0),
+                "turnovers": int(row.get("TOV", 0) or 0),
+                "plus_minus": float(row.get("PLUS_MINUS", 0) or 0),
+            })
+        return games
+    except Exception as e:
+        logger.warning(f"get_team_game_logs failed: {e}")
         return []
 
-    games = []
-    for _, row in df.iterrows():
-        games.append({
-            "game_id": row.get("GAME_ID"),
-            "game_date": str(row.get("GAME_DATE", "")),
-            "matchup": row.get("MATCHUP", ""),
-            "is_home": "vs." in str(row.get("MATCHUP", "")),
-            "win": row.get("WL", "") == "W",
-            "points": int(row.get("PTS", 0) or 0),
-            "opp_points": int(row.get("OPP_PTS", 0) or 0) if "OPP_PTS" in row else None,
-            "fg_pct": float(row.get("FG_PCT", 0) or 0),
-            "three_pct": float(row.get("FG3_PCT", 0) or 0),
-            "three_attempted": float(row.get("FG3A", 0) or 0),
-            "ft_attempted": float(row.get("FTA", 0) or 0),
-            "rebounds": int(row.get("REB", 0) or 0),
-            "assists": int(row.get("AST", 0) or 0),
-            "turnovers": int(row.get("TOV", 0) or 0),
-            "plus_minus": float(row.get("PLUS_MINUS", 0) or 0),
-        })
-    return games
 
-
-def get_team_advanced_stats():
-    """
-    Get league-wide team advanced stats:
-    OFF_RATING, DEF_RATING, NET_RATING, PACE, TS_PCT, etc.
-    This is the gold standard — same as NBA.com/stats
-    """
-    result = safe_call(
-        leaguedashteamstats.LeagueDashTeamStats,
-        season=CURRENT_SEASON,
-        season_type_all_star=SEASON_TYPE,
-        measure_type_detailed_defense="Advanced",
-        per_mode_simple="PerGame",
-    )
-    if not result:
-        return {}
-
-    df = result.get_data_frames()[0]
-    stats = {}
-    for _, row in df.iterrows():
-        team_id = row.get("TEAM_ID")
-        stats[team_id] = {
-            "team_name": row.get("TEAM_NAME"),
-            "off_rating": float(row.get("OFF_RATING", 110) or 110),
-            "def_rating": float(row.get("DEF_RATING", 110) or 110),
-            "net_rating": float(row.get("NET_RATING", 0) or 0),
-            "pace": float(row.get("PACE", 100) or 100),
-            "ts_pct": float(row.get("TS_PCT", 0.55) or 0.55),
-            "ast_pct": float(row.get("AST_PCT", 0) or 0),
-            "reb_pct": float(row.get("REB_PCT", 0) or 0),
-            "tov_pct": float(row.get("TM_TOV_PCT", 0) or 0),
-            "efg_pct": float(row.get("EFG_PCT", 0) or 0),
-            "wins": int(row.get("W", 0) or 0),
-            "losses": int(row.get("L", 0) or 0),
-        }
-    return stats
-
-
-def get_team_recent_stats(team_id: int, last_n: int = 10):
-    """
-    Get rolling window stats for a team over last N games.
-    Returns averaged stats across the window.
-    """
-    result = safe_call(
-        leaguedashteamstats.LeagueDashTeamStats,
-        season=CURRENT_SEASON,
-        season_type_all_star=SEASON_TYPE,
-        measure_type_detailed_defense="Base",
-        per_mode_simple="PerGame",
-        last_n_games=last_n,
-        team_id_nullable=team_id,
-    )
-    if not result:
-        return {}
-
-    df = result.get_data_frames()[0]
-    if df.empty:
-        return {}
-
-    row = df.iloc[0]
-    return {
-        "pts": float(row.get("PTS", 0) or 0),
-        "opp_pts": float(row.get("OPP_PTS", 0) or 0) if "OPP_PTS" in row else None,
-        "fg_pct": float(row.get("FG_PCT", 0) or 0),
-        "three_pct": float(row.get("FG3_PCT", 0) or 0),
-        "three_attempted": float(row.get("FG3A", 0) or 0),
-        "rebounds": float(row.get("REB", 0) or 0),
-        "assists": float(row.get("AST", 0) or 0),
-        "turnovers": float(row.get("TOV", 0) or 0),
-        "wins": int(row.get("W", 0) or 0),
-        "losses": int(row.get("L", 0) or 0),
-    }
-
-
-def get_h2h_history(team_id: int, opponent_id: int, seasons: int = 2):
-    """
-    Get head-to-head game history between two teams.
-    Looks back across multiple seasons.
-    """
+def get_h2h_history(team_id: int, opponent_id: int):
     all_games = []
-    season_years = [2024, 2023]  # 2024-25, 2023-24
-
-    for year in season_years[:seasons]:
+    for year in [2024, 2023]:
         season_str = f"{year}-{str(year+1)[-2:]}"
         result = safe_call(
             leaguegamefinder.LeagueGameFinder,
@@ -216,61 +171,22 @@ def get_h2h_history(team_id: int, opponent_id: int, seasons: int = 2):
         )
         if not result:
             continue
-        df = result.get_data_frames()[0]
-        for _, row in df.iterrows():
-            pts = int(row.get("PTS", 0) or 0)
-            plus_minus = float(row.get("PLUS_MINUS", 0) or 0)
-            all_games.append({
-                "season": season_str,
-                "date": str(row.get("GAME_DATE", "")),
-                "home_win": plus_minus > 0 and "vs." in str(row.get("MATCHUP", "")),
-                "total_pts": pts + max(0, pts - plus_minus),  # approx total
-                "margin": abs(plus_minus),
-            })
-
+        try:
+            df = result.get_data_frames()[0]
+            for _, row in df.iterrows():
+                pts = int(row.get("PTS", 0) or 0)
+                plus_minus = float(row.get("PLUS_MINUS", 0) or 0)
+                all_games.append({
+                    "home_win": plus_minus > 0 and "vs." in str(row.get("MATCHUP", "")),
+                    "total_pts": pts * 2 - plus_minus,
+                    "margin": abs(plus_minus),
+                })
+        except Exception:
+            continue
     return all_games
 
 
-def get_player_stats_for_team(team_id: int):
-    """
-    Get player-level stats for a team — usage rates, minutes, scoring.
-    Used to identify key players and assess injury impact.
-    """
-    result = safe_call(
-        leaguedashplayerstats.LeagueDashPlayerStats,
-        season=CURRENT_SEASON,
-        season_type_all_star=SEASON_TYPE,
-        measure_type_detailed_defense="Advanced",
-        per_mode_simple="PerGame",
-        team_id_nullable=team_id,
-    )
-    if not result:
-        return []
-
-    df = result.get_data_frames()[0]
-    players = []
-    for _, row in df.iterrows():
-        players.append({
-            "player_id": row.get("PLAYER_ID"),
-            "name": row.get("PLAYER_NAME"),
-            "usage_rate": float(row.get("USG_PCT", 0) or 0),
-            "minutes": float(row.get("MIN", 0) or 0),
-            "pie": float(row.get("PIE", 0) or 0),  # Player Impact Estimate
-            "off_rating": float(row.get("OFF_RATING", 0) or 0),
-            "def_rating": float(row.get("DEF_RATING", 0) or 0),
-            "net_rating": float(row.get("NET_RATING", 0) or 0),
-        })
-
-    # Sort by usage rate — highest usage = most important
-    players.sort(key=lambda p: p["usage_rate"], reverse=True)
-    return players[:12]  # Top 12 rotation players
-
-
 def get_rest_days(team_id: int) -> dict:
-    """
-    Calculate rest days for a team by checking their last game date.
-    Returns rest_days count and whether they're on a b2b.
-    """
     result = safe_call(
         teamgamelogs.TeamGameLogs,
         team_id_nullable=team_id,
@@ -280,32 +196,25 @@ def get_rest_days(team_id: int) -> dict:
     )
     if not result:
         return {"rest_days": 2, "is_b2b": False}
-
-    df = result.get_data_frames()[0]
-    if df.empty or len(df) < 1:
-        return {"rest_days": 2, "is_b2b": False}
-
-    today = date.today()
-    last_game_date_str = str(df.iloc[0].get("GAME_DATE", ""))
     try:
-        last_game_date = datetime.strptime(last_game_date_str, "%Y-%m-%dT%H:%M:%S").date()
-    except:
-        try:
-            last_game_date = datetime.strptime(last_game_date_str[:10], "%Y-%m-%d").date()
-        except:
+        df = result.get_data_frames()[0]
+        if df.empty:
             return {"rest_days": 2, "is_b2b": False}
-
-    rest = (today - last_game_date).days
-    return {
-        "rest_days": rest,
-        "is_b2b": rest <= 1,
-    }
+        today = date.today()
+        last_date_str = str(df.iloc[0].get("GAME_DATE", ""))[:10]
+        for fmt in ["%Y-%m-%d", "%b %d, %Y"]:
+            try:
+                last_date = datetime.strptime(last_date_str, fmt).date()
+                rest = (today - last_date).days
+                return {"rest_days": rest, "is_b2b": rest <= 1}
+            except:
+                continue
+    except Exception:
+        pass
+    return {"rest_days": 2, "is_b2b": False}
 
 
 def get_home_away_splits(team_id: int):
-    """
-    Get home vs away performance splits for the season.
-    """
     splits = {}
     for location in ["Home", "Road"]:
         result = safe_call(
@@ -313,18 +222,50 @@ def get_home_away_splits(team_id: int):
             season=CURRENT_SEASON,
             season_type_all_star=SEASON_TYPE,
             measure_type_detailed_defense="Base",
-            per_mode_simple="PerGame",
+            per_mode_detailed="PerGame",
             location_nullable=location,
             team_id_nullable=team_id,
         )
         if result:
-            df = result.get_data_frames()[0]
-            if not df.empty:
-                row = df.iloc[0]
-                splits[location.lower()] = {
-                    "pts": float(row.get("PTS", 0) or 0),
-                    "wins": int(row.get("W", 0) or 0),
-                    "losses": int(row.get("L", 0) or 0),
-                    "net_rating": float(row.get("PLUS_MINUS", 0) or 0),
-                }
+            try:
+                df = result.get_data_frames()[0]
+                if not df.empty:
+                    row = df.iloc[0]
+                    splits[location.lower()] = {
+                        "pts": float(row.get("PTS", 0) or 0),
+                        "wins": int(row.get("W", 0) or 0),
+                        "losses": int(row.get("L", 0) or 0),
+                        "net_rating": float(row.get("PLUS_MINUS", 0) or 0),
+                    }
+            except Exception:
+                continue
     return splits
+
+
+def get_player_stats_for_team(team_id: int):
+    result = safe_call(
+        leaguedashplayerstats.LeagueDashPlayerStats,
+        season=CURRENT_SEASON,
+        season_type_all_star=SEASON_TYPE,
+        measure_type_detailed_defense="Advanced",
+        per_mode_detailed="PerGame",
+        team_id_nullable=team_id,
+    )
+    if not result:
+        return []
+    try:
+        df = result.get_data_frames()[0]
+        players = []
+        for _, row in df.iterrows():
+            players.append({
+                "name": row.get("PLAYER_NAME"),
+                "usage_rate": float(row.get("USG_PCT", 0) or 0),
+                "minutes": float(row.get("MIN", 0) or 0),
+                "pie": float(row.get("PIE", 0) or 0),
+                "net_rating": float(row.get("NET_RATING", 0) or 0),
+            })
+        players.sort(key=lambda p: p["usage_rate"], reverse=True)
+        return players[:12]
+    except Exception as e:
+        logger.warning(f"get_player_stats_for_team failed: {e}")
+        return []
