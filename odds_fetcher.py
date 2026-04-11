@@ -64,7 +64,8 @@ def fetch_odds_for_games(games: list) -> dict:
             key = frozenset([home, away])
             odds_lookup[key] = event
 
-    logger.info(f"Odds events available: {[f'{e.get(\"away_team\")} @ {e.get(\"home_team\")}' for e in odds_data]}")
+    event_list = [f"{e.get('away_team')} @ {e.get('home_team')}" for e in odds_data]
+logger.info(f"Odds events available: {event_list}")
 
     result = {}
     for game in games:
