@@ -1,4 +1,4 @@
-# odds_fetcher.py — Matches by full team name (what Odds API actually returns)
+# odds_fetcher.py — Matches by full team name
 
 import logging
 import requests
@@ -8,7 +8,6 @@ logger = logging.getLogger(__name__)
 ODDS_API_KEY = "61040feb939ef2fe29c0e8c8fa8eb152"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
 
-# Tricode → full name (for converting NBA live data to match Odds API names)
 ABBREV_TO_FULL = {
     "ATL": "Atlanta Hawks",        "BOS": "Boston Celtics",
     "BKN": "Brooklyn Nets",        "CHA": "Charlotte Hornets",
@@ -29,10 +28,6 @@ ABBREV_TO_FULL = {
 
 
 def fetch_odds_for_games(games: list) -> dict:
-    """
-    Fetch NBA odds and map to game IDs by matching full team names.
-    Returns {game_id: {spread_line, spread_odds, total_line, total_odds, home_odds, away_odds}}
-    """
     try:
         r = requests.get(
             f"{ODDS_BASE}/sports/basketball_nba/odds",
@@ -47,15 +42,22 @@ def fetch_odds_for_games(games: list) -> dict:
         r.raise_for_status()
         odds_data = r.json()
         if not isinstance(odds_data, list):
-            logger.error(f"Odds API unexpected response: {odds_data}")
+            logger.error("Odds API unexpected response: %s", odds_data)
             return {}
-        logger.info(f"Odds API returned {len(odds_data)} events")
+        logger.info("Odds API returned %d events", len(odds_data))
     except Exception as e:
-        logger.error(f"Odds fetch failed: {e}")
+        logger.error("Odds fetch failed: %s", e)
         return {}
 
-    # Build lookup by frozenset of both team names (order-independent)
-    # This handles home/away flip between data sources
+    # Log available events without backslashes in f-strings
+    event_names = []
+    for e in odds_data:
+        away = e.get("away_team", "")
+        home = e.get("home_team", "")
+        event_names.append(away + " @ " + home)
+    logger.info("Odds events: %s", event_names)
+
+    # Build lookup by frozenset of team names (order-independent)
     odds_lookup = {}
     for event in odds_data:
         home = event.get("home_team", "")
@@ -64,49 +66,42 @@ def fetch_odds_for_games(games: list) -> dict:
             key = frozenset([home, away])
             odds_lookup[key] = event
 
-    event_list = [f"{e.get('away_team')} @ {e.get('home_team')}" for e in odds_data]
-logger.info(f"Odds events available: {event_list}")
-
     result = {}
     for game in games:
         game_id = game.get("game_id")
         home_abbrev = game.get("home_team_abbrev", "")
         away_abbrev = game.get("away_team_abbrev", "")
 
-        # Convert tricodes to full names
         home_full = ABBREV_TO_FULL.get(home_abbrev, "")
         away_full = ABBREV_TO_FULL.get(away_abbrev, "")
 
         if not home_full or not away_full:
-            # Try building from city + name
-            home_full = f"{game.get('home_team_city','')} {game.get('home_team','')}".strip()
-            away_full = f"{game.get('away_team_city','')} {game.get('away_team','')}".strip()
+            home_full = (game.get("home_team_city", "") + " " + game.get("home_team", "")).strip()
+            away_full = (game.get("away_team_city", "") + " " + game.get("away_team", "")).strip()
 
         key = frozenset([home_full, away_full])
         event = odds_lookup.get(key)
 
         if not event:
-            logger.warning(f"No odds for {away_abbrev} @ {home_abbrev} ({away_full} @ {home_full})")
+            logger.warning("No odds for %s @ %s", away_abbrev, home_abbrev)
             continue
 
         parsed = _parse_event(event, home_full)
         if parsed:
             result[game_id] = parsed
             logger.info(
-                f"✅ Matched {away_abbrev} @ {home_abbrev}: "
-                f"spread={parsed.get('spread_line')}, total={parsed.get('total_line')}, "
-                f"home_odds={parsed.get('home_odds')}"
+                "Matched odds for %s @ %s: spread=%s total=%s",
+                away_abbrev, home_abbrev,
+                parsed.get("spread_line"), parsed.get("total_line")
             )
 
-    logger.info(f"Odds matched {len(result)}/{len(games)} games")
+    logger.info("Odds matched %d/%d games", len(result), len(games))
     return result
 
 
 def _parse_event(event: dict, home_full: str) -> dict:
-    """Extract best odds from bookmakers. home_full used to identify home team outcomes."""
     home_odds = away_odds = spread_line = spread_odds = total_line = total_odds = None
 
-    # Preferred bookmakers in order
     preferred = ["draftkings", "fanduel", "betmgm", "williamhill_us", "bovada", "barstool"]
 
     def book_rank(b):
