@@ -1,72 +1,190 @@
-# nba_data.py — Batch calls only. No per-team loops.
-# 6 total API calls instead of 150. Runs in ~15 seconds.
+# nba_data.py — Uses upcoming schedule (not live scoreboard)
+# The live scoreboard shows completed games. We need upcoming games
+# to match what The Odds API shows.
 
 import logging
 import time
+import requests
 from datetime import datetime, date
 
 logger = logging.getLogger(__name__)
 
 from nba_api.stats.endpoints import (
     leaguegamefinder,
-    teamgamelogs,
     leaguedashteamstats,
     leaguedashplayerstats,
 )
-from nba_api.live.nba.endpoints import scoreboard as live_scoreboard
 
-SLEEP_BETWEEN_CALLS = 0.6
 CURRENT_SEASON = "2024-25"
 SEASON_TYPE = "Regular Season"
+SLEEP = 0.6
+
+ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
+NBA_CDN   = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
 
 
 def safe_call(fn, *args, retries=3, **kwargs):
     for attempt in range(retries):
         try:
-            time.sleep(SLEEP_BETWEEN_CALLS)
+            time.sleep(SLEEP)
             return fn(*args, **kwargs)
         except Exception as e:
-            logger.warning(f"NBA API call failed (attempt {attempt+1}): {e}")
+            logger.warning("NBA API call failed (attempt %d): %s", attempt+1, e)
             if attempt < retries - 1:
                 time.sleep(2 ** attempt)
     return None
 
 
 def get_today_games():
-    """Get today's games from NBA live scoreboard."""
+    """
+    Get TODAY'S upcoming NBA games.
+    Uses ESPN scoreboard which correctly shows today's scheduled games
+    including ones that haven't tipped off yet.
+    Falls back to NBA CDN schedule.
+    """
+    today = date.today()
+    games = _fetch_espn_schedule(today)
+    if not games:
+        logger.warning("ESPN schedule empty, trying NBA CDN...")
+        games = _fetch_nba_cdn_schedule(today)
+    logger.info("Found %d games for %s", len(games), today)
+    return games
+
+
+def _fetch_espn_schedule(target_date: date) -> list:
+    """
+    ESPN scoreboard — shows today's games including pre-game.
+    Returns games in same format as before.
+    """
     try:
-        sb = live_scoreboard.ScoreBoard()
-        data = sb.get_dict()
-        games = data.get("scoreboard", {}).get("games", [])
-        result = []
-        for g in games:
-            result.append({
-                "game_id": g["gameId"],
-                "status": g["gameStatusText"],
-                "home_team_id": g["homeTeam"]["teamId"],
-                "home_team": g["homeTeam"]["teamName"],
-                "home_team_city": g["homeTeam"]["teamCity"],
-                "home_team_abbrev": g["homeTeam"]["teamTricode"],
-                "home_score": g["homeTeam"].get("score", 0),
-                "away_team_id": g["awayTeam"]["teamId"],
-                "away_team": g["awayTeam"]["teamName"],
-                "away_team_city": g["awayTeam"]["teamCity"],
-                "away_team_abbrev": g["awayTeam"]["teamTricode"],
-                "away_score": g["awayTeam"].get("score", 0),
-                "game_time": g.get("gameStatusText", ""),
-                "arena": g.get("arenaName", ""),
+        date_str = target_date.strftime("%Y%m%d")
+        r = requests.get(
+            ESPN_BASE + "/scoreboard",
+            params={"dates": date_str},
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        r.raise_for_status()
+        data = r.json()
+        events = data.get("events", [])
+        games = []
+        for ev in events:
+            comp = ev.get("competitions", [{}])[0]
+            competitors = comp.get("competitors", [])
+            home = next((c for c in competitors if c.get("homeAway") == "home"), {})
+            away = next((c for c in competitors if c.get("homeAway") == "away"), {})
+
+            home_team = home.get("team", {})
+            away_team = away.get("team", {})
+
+            # Get NBA team IDs from ESPN (they differ from NBA.com IDs)
+            # We'll use abbreviation-based matching instead of IDs
+            home_abbrev = home_team.get("abbreviation", "")
+            away_abbrev = away_team.get("abbreviation", "")
+
+            # Map ESPN team IDs to NBA.com team IDs
+            home_nba_id = _espn_to_nba_id(home_abbrev)
+            away_nba_id = _espn_to_nba_id(away_abbrev)
+
+            status = comp.get("status", {}).get("type", {}).get("description", "Scheduled")
+            game_time = ev.get("date", "")
+
+            # Format game time for display
+            try:
+                dt = datetime.fromisoformat(game_time.replace("Z", "+00:00"))
+                # Convert to local-ish display (show ET)
+                display_time = dt.strftime("%-I:%M %p ET")
+            except Exception:
+                display_time = "TBD"
+
+            games.append({
+                "game_id":          ev.get("id", ""),
+                "status":           status,
+                "game_time":        display_time,
+                "home_team_id":     home_nba_id,
+                "home_team":        home_team.get("name", ""),
+                "home_team_city":   home_team.get("location", ""),
+                "home_team_abbrev": home_abbrev,
+                "home_score":       int(home.get("score", 0) or 0),
+                "away_team_id":     away_nba_id,
+                "away_team":        away_team.get("name", ""),
+                "away_team_city":   away_team.get("location", ""),
+                "away_team_abbrev": away_abbrev,
+                "away_score":       int(away.get("score", 0) or 0),
+                "arena":            comp.get("venue", {}).get("fullName", ""),
+                "source":           "espn",
             })
-        return result
+        logger.info("ESPN returned %d games for %s", len(games), target_date)
+        return games
     except Exception as e:
-        logger.error(f"get_today_games failed: {e}")
+        logger.error("ESPN schedule fetch failed: %s", e)
         return []
 
 
+def _fetch_nba_cdn_schedule(target_date: date) -> list:
+    """
+    NBA CDN static schedule — fallback.
+    Slower but comprehensive.
+    """
+    try:
+        r = requests.get(NBA_CDN, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        data = r.json()
+        today_str = target_date.isoformat()
+        games = []
+
+        game_dates = data.get("leagueSchedule", {}).get("gameDates", [])
+        for gd in game_dates:
+            if gd.get("gameDate", "")[:10] != today_str:
+                continue
+            for g in gd.get("games", []):
+                home = g.get("homeTeam", {})
+                away = g.get("awayTeam", {})
+                games.append({
+                    "game_id":          str(g.get("gameId", "")),
+                    "status":           g.get("gameStatusText", "Scheduled"),
+                    "game_time":        g.get("gameDateTimeEst", "")[-8:-3] + " ET",
+                    "home_team_id":     home.get("teamId"),
+                    "home_team":        home.get("teamName", ""),
+                    "home_team_city":   home.get("teamCity", ""),
+                    "home_team_abbrev": home.get("teamTricode", ""),
+                    "home_score":       home.get("score", 0),
+                    "away_team_id":     away.get("teamId"),
+                    "away_team":        away.get("teamName", ""),
+                    "away_team_city":   away.get("teamCity", ""),
+                    "away_team_abbrev": away.get("teamTricode", ""),
+                    "away_score":       away.get("score", 0),
+                    "arena":            g.get("arenaName", ""),
+                    "source":           "nba_cdn",
+                })
+        logger.info("NBA CDN returned %d games for %s", len(games), target_date)
+        return games
+    except Exception as e:
+        logger.error("NBA CDN schedule fetch failed: %s", e)
+        return []
+
+
+# ── ESPN team abbreviation → NBA.com team ID ──────────────────
+# NBA.com IDs are stable. ESPN abbreviations match NBA tricodes.
+ABBREV_TO_NBA_ID = {
+    "ATL": 1610612737, "BOS": 1610612738, "BKN": 1610612751,
+    "CHA": 1610612766, "CHI": 1610612741, "CLE": 1610612739,
+    "DAL": 1610612742, "DEN": 1610612743, "DET": 1610612765,
+    "GSW": 1610612744, "HOU": 1610612745, "IND": 1610612754,
+    "LAC": 1610612746, "LAL": 1610612747, "MEM": 1610612763,
+    "MIA": 1610612748, "MIL": 1610612749, "MIN": 1610612750,
+    "NOP": 1610612740, "NYK": 1610612752, "OKC": 1610612760,
+    "ORL": 1610612753, "PHI": 1610612755, "PHX": 1610612756,
+    "POR": 1610612757, "SAC": 1610612758, "SAS": 1610612759,
+    "TOR": 1610612761, "UTA": 1610612762, "WAS": 1610612764,
+}
+
+def _espn_to_nba_id(abbrev: str) -> int:
+    return ABBREV_TO_NBA_ID.get(abbrev, 0)
+
+
 def get_all_team_stats_batch(measure_type="Advanced", location=None, last_n=None):
-    """
-    Fetch stats for ALL 30 teams in ONE API call.
-    Returns {team_id: stats_dict}
-    """
+    """Fetch stats for ALL 30 teams in ONE API call."""
     kwargs = dict(
         season=CURRENT_SEASON,
         season_type_all_star=SEASON_TYPE,
@@ -81,7 +199,6 @@ def get_all_team_stats_batch(measure_type="Advanced", location=None, last_n=None
     result = safe_call(leaguedashteamstats.LeagueDashTeamStats, **kwargs)
     if not result:
         return {}
-
     try:
         df = result.get_data_frames()[0]
         stats = {}
@@ -100,33 +217,32 @@ def get_all_team_stats_batch(measure_type="Advanced", location=None, last_n=None
                 }
             else:
                 stats[team_id] = {
-                    "pts":        float(row.get("PTS", 0)     or 0),
-                    "fg_pct":     float(row.get("FG_PCT", 0)  or 0),
-                    "three_pct":  float(row.get("FG3_PCT", 0) or 0),
-                    "rebounds":   float(row.get("REB", 0)     or 0),
-                    "assists":    float(row.get("AST", 0)     or 0),
-                    "turnovers":  float(row.get("TOV", 0)     or 0),
-                    "wins":       int(row.get("W", 0)         or 0),
-                    "losses":     int(row.get("L", 0)         or 0),
+                    "pts":        float(row.get("PTS", 0)        or 0),
+                    "fg_pct":     float(row.get("FG_PCT", 0)     or 0),
+                    "three_pct":  float(row.get("FG3_PCT", 0)    or 0),
+                    "rebounds":   float(row.get("REB", 0)        or 0),
+                    "assists":    float(row.get("AST", 0)        or 0),
+                    "turnovers":  float(row.get("TOV", 0)        or 0),
+                    "wins":       int(row.get("W", 0)            or 0),
+                    "losses":     int(row.get("L", 0)            or 0),
                     "net_rating": float(row.get("PLUS_MINUS", 0) or 0),
                 }
-        logger.info(f"Batch stats ({measure_type}, loc={location}, L{last_n}): {len(stats)} teams")
+        logger.info(
+            "Batch stats (%s, loc=%s, L%s): %d teams",
+            measure_type, location, last_n, len(stats)
+        )
         return stats
     except Exception as e:
-        logger.warning(f"get_all_team_stats_batch failed: {e}")
+        logger.warning("get_all_team_stats_batch failed: %s", e)
         return {}
 
 
 def get_all_team_recent_batch(last_n: int):
-    """Get rolling window stats for all teams in one call."""
     return get_all_team_stats_batch("Base", last_n=last_n)
 
 
 def get_all_player_stats_batch():
-    """
-    Get player stats for ALL players in ONE call.
-    Returns {team_id: [player_dicts]}
-    """
+    """Get player advanced stats for ALL players in one call."""
     result = safe_call(
         leaguedashplayerstats.LeagueDashPlayerStats,
         season=CURRENT_SEASON,
@@ -136,7 +252,6 @@ def get_all_player_stats_batch():
     )
     if not result:
         return {}
-
     try:
         df = result.get_data_frames()[0]
         team_players = {}
@@ -146,32 +261,24 @@ def get_all_player_stats_batch():
                 team_players[team_id] = []
             team_players[team_id].append({
                 "name":       row.get("PLAYER_NAME", ""),
-                "usage_rate": float(row.get("USG_PCT", 0)    or 0),
-                "minutes":    float(row.get("MIN", 0)         or 0),
-                "pie":        float(row.get("PIE", 0)         or 0),
-                "net_rating": float(row.get("NET_RATING", 0)  or 0),
+                "usage_rate": float(row.get("USG_PCT", 0)   or 0),
+                "minutes":    float(row.get("MIN", 0)        or 0),
+                "pie":        float(row.get("PIE", 0)        or 0),
+                "net_rating": float(row.get("NET_RATING", 0) or 0),
             })
-        # Sort each team's players by usage rate
         for tid in team_players:
             team_players[tid].sort(key=lambda p: p["usage_rate"], reverse=True)
-            team_players[tid] = team_players[tid][:12]
-        logger.info(f"Player stats batch: {len(team_players)} teams")
+        logger.info("Player adv stats: %d teams", len(team_players))
         return team_players
     except Exception as e:
-        logger.warning(f"get_all_player_stats_batch failed: {e}")
+        logger.warning("get_all_player_stats_batch failed: %s", e)
         return {}
 
 
-def get_all_game_logs_batch():
-    """Placeholder — game logs not used in batch mode to save time."""
-    return {}
-
-
 def get_h2h_history(team_id: int, opponent_id: int):
-    """H2H history — called selectively, not for every game."""
     all_games = []
     for year in [2024, 2023]:
-        season_str = f"{year}-{str(year+1)[-2:]}"
+        season_str = str(year) + "-" + str(year+1)[-2:]
         result = safe_call(
             leaguegamefinder.LeagueGameFinder,
             team_id_nullable=team_id,
