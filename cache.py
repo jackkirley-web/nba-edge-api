@@ -1,4 +1,4 @@
-# cache.py — Fast boot, BDL/ESPN primary, zero NBA.com in hot path
+# cache.py — Clean version, NBA.com primary, games-only fallback
 
 import logging
 import threading
@@ -6,8 +6,8 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-MAIN_TTL   = 300    # 5 min
-STREAK_TTL = 1800   # 30 min
+MAIN_TTL   = 300
+STREAK_TTL = 1800
 
 
 class MainCache:
@@ -35,12 +35,11 @@ class MainCache:
                         except Exception:
                             pass
                     else:
-                        # Full fetch failed — try disk, then games-only
                         if not self._data:
                             self._data = self._from_disk() or self._games_only()
                         self._last_refresh = datetime.now()
                 except Exception as e:
-                    logger.error("Main cache fetch crashed: %s", e)
+                    logger.error("Main cache crash: %s", e)
                     if not self._data:
                         self._data = self._from_disk() or self._games_only()
                     self._last_refresh = datetime.now()
@@ -48,7 +47,6 @@ class MainCache:
         with self._lock:
             return self._data
 
-    # ── Full fetch ────────────────────────────────────────────
     def _fetch_all(self) -> dict:
         from nba_data import (
             get_today_games, get_all_team_stats_batch,
@@ -62,38 +60,32 @@ class MainCache:
 
         logger.info("=== Main cache fetch start ===")
 
-        # Schedule — ESPN, always fast
         games = get_today_games()
         logger.info("Games: %d", len(games))
         if not games:
             return None
 
-        # Team stats — ESPN standings + BDL, NO NBA.com
-        logger.info("Team stats (ESPN/BDL)...")
+        logger.info("League stats...")
         adv_stats       = get_all_team_stats_batch("Advanced")
         base_l10        = get_all_team_recent_batch(10)
         base_l5         = get_all_team_recent_batch(5)
-        home_splits     = {}   # Not available without NBA.com — engine handles gracefully
-        road_splits     = {}
+        home_splits     = get_all_team_stats_batch("Base", location="Home")
+        road_splits     = get_all_team_stats_batch("Base", location="Road")
         all_players_adv = get_all_player_stats_batch()
 
-        # Player base stats — BDL v2, fallback ESPN
-        logger.info("Player base stats (BDL v2)...")
+        logger.info("Player base stats...")
         player_base = get_all_player_base_stats()
         if not player_base:
-            logger.warning("Player base stats empty — using games-only fallback")
+            logger.warning("Player base stats empty — falling back to games-only")
             return None
 
-        # Injuries — ESPN, always fast
         logger.info("Injuries...")
         injuries_by_team = fetch_official_injury_report()
 
-        # Odds — The Odds API, always fast
         logger.info("Odds...")
         odds_by_game = fetch_odds_for_games(games)
         logger.info("Odds matched: %d/%d", len(odds_by_game), len(games))
 
-        # Filter to today's players
         today_team_ids = set()
         for g in games:
             if g.get("home_team_id"): today_team_ids.add(int(g["home_team_id"]))
@@ -105,7 +97,6 @@ class MainCache:
         }
         logger.info("Rotation players: %d", len(today_players))
 
-        # Score legs and props
         all_legs, all_props, enriched_games = [], [], []
 
         for game in games:
@@ -131,6 +122,7 @@ class MainCache:
                     adv_stats, base_l5, base_l10, home_splits,
                     road_splits, all_players_adv, injuries_by_team
                 )
+
                 game_odds = odds_by_game.get(game["game_id"], {})
                 enriched_games.append({
                     **game, **game_odds,
@@ -145,8 +137,8 @@ class MainCache:
                 if game_odds.get("spread_line") is not None:
                     line     = game_odds["spread_line"]
                     home_fav = line < 0
-                    sr = score_spread_leg(home_ctx, away_ctx, abs(line), home_fav,
-                                         game_odds.get("spread_odds", 1.91))
+                    sr  = score_spread_leg(home_ctx, away_ctx, abs(line), home_fav,
+                                           game_odds.get("spread_odds", 1.91))
                     sel = f"{home_abbrev} {line:+.1f}" if home_fav else f"{away_abbrev} +{abs(line):.1f}"
                     all_legs.append({**sr, "game_id": game["game_id"],
                         "game": label, "selection": sel,
@@ -198,15 +190,14 @@ class MainCache:
                                 for prop in pr["scored_props"]:
                                     all_props.append({**prop,
                                         "game_id": game["game_id"],
-                                        "game":    label,
-                                        "team":    ta,
+                                        "game": label, "team": ta,
                                         "player_id": pid,
                                         "is_bench": pdata.get("mins", 0) < 28})
                         except Exception:
                             pass
 
             except Exception as e:
-                logger.warning("Game processing failed %s: %s", game.get("game_id"), e)
+                logger.warning("Game failed %s: %s", game.get("game_id"), e)
                 enriched_games.append(game)
 
         logger.info("Legs: %d | Props: %d", len(all_legs), len(all_props))
@@ -219,8 +210,8 @@ class MainCache:
                     "game_id": p["game_id"], "game": p["game"],
                     "type": "Prop — "+p["stat_label"], "selection": sel,
                     "odds": 1.91, "confidence": p["confidence"], "prob": p["prob"],
-                    "tags": p.get("tags", []), "reasoning": p.get("reasoning", ""),
-                    "factors": [], "projected_margin": None, "projected_total": None,
+                    "tags": p.get("tags",[]), "reasoning": p.get("reasoning",""),
+                    "factors":[], "projected_margin":None, "projected_total":None,
                     "edge": p.get("edge"),
                 })
 
@@ -243,7 +234,6 @@ class MainCache:
             "_today_team_ids": today_team_ids,
         }
 
-    # ── Fallbacks ─────────────────────────────────────────────
     def _from_disk(self) -> dict:
         try:
             from data_store import load_main_data, get_data_age_str
@@ -252,14 +242,12 @@ class MainCache:
                 age = get_data_age_str()
                 data["_stale"]        = True
                 data["_stale_reason"] = f"Showing cached data from {age}"
-                logger.info("Loaded from disk (%s)", age)
                 return data
-        except Exception as e:
-            logger.warning("Disk load failed: %s", e)
+        except Exception:
+            pass
         return {}
 
     def _games_only(self) -> dict:
-        """Show games + odds even when all player data fails."""
         logger.info("Games-only fallback")
         try:
             from nba_data import get_today_games
@@ -268,7 +256,7 @@ class MainCache:
             games    = get_today_games() or []
             odds     = fetch_odds_for_games(games) if games else {}
             enriched = [{**g, **odds.get(g["game_id"], {}),
-                         "home_injuries": [], "away_injuries": []}
+                         "home_injuries":[], "away_injuries":[]}
                         for g in games]
             return {
                 "games": enriched, "legs": [], "props": [],
@@ -276,18 +264,18 @@ class MainCache:
                 "injuries": {}, "last_updated": _now(),
                 "games_analyzed": len(games), "props_scored": 0, "legs_scored": 0,
                 "_stale": True,
-                "_stale_reason": "Player stats unavailable — showing games and odds only",
+                "_stale_reason": "Player stats unavailable — showing games and odds only. NBA.com may be temporarily down.",
                 "_today_players": {}, "_today_team_ids": set(),
             }
         except Exception as e:
             logger.error("Games-only fallback failed: %s", e)
             return {
-                "games": [], "picks": _empty_picks(), "injuries": {},
-                "legs": [], "props": [], "last_updated": _now(),
-                "games_analyzed": 0, "props_scored": 0, "legs_scored": 0,
+                "games":[], "picks":_empty_picks(), "injuries":{},
+                "legs":[], "props":[], "last_updated":_now(),
+                "games_analyzed":0, "props_scored":0, "legs_scored":0,
                 "_stale": True,
                 "_stale_reason": "Data temporarily unavailable. Please refresh in a few minutes.",
-                "_today_players": {}, "_today_team_ids": set(),
+                "_today_players":{}, "_today_team_ids":set(),
             }
 
 
@@ -312,7 +300,6 @@ class StreakCache:
                         disk = load_streak_data()
                         if disk:
                             self._data = disk
-                            logger.info("Loaded %d streaks from disk", len(disk))
                     except Exception:
                         pass
             self._start_bg()
@@ -346,7 +333,6 @@ class StreakCache:
                     self._loading = False
                 return
 
-            # Top 10 by minutes per team
             fetch_ids = []
             for tid in team_ids:
                 tp = sorted(
@@ -357,9 +343,8 @@ class StreakCache:
                 fetch_ids.extend([pid for pid, _ in tp[:10]])
 
             logger.info("Streak: fetching logs for %d players", len(fetch_ids))
-            logs = get_player_game_logs_batch(fetch_ids, last_n=15)
+            logs    = get_player_game_logs_batch(fetch_ids, last_n=15)
             logger.info("Streak: got logs for %d players", len(logs))
-
             streaks = calculate_streaks(
                 player_base=today_players,
                 player_logs=logs,
@@ -385,8 +370,6 @@ class StreakCache:
                 self._loading = False
 
 
-# ─── HELPERS ──────────────────────────────────────────────────
-
 def _build_ctx(team_id, abbrev, full_name, is_home,
                adv_stats, base_l5, base_l10, home_splits,
                road_splits, all_players_adv, injuries_by_team):
@@ -395,20 +378,21 @@ def _build_ctx(team_id, abbrev, full_name, is_home,
     team_inj = (injuries_by_team.get(full_name)
                 or injuries_by_team.get(abbrev) or [])
     return {
-        "team_id":     team_id,
-        "team_abbrev": abbrev,
-        "team_name":   full_name,
-        "is_home":     is_home,
-        "advanced":    adv_stats.get(team_id, {}),
-        "recent_l5":   base_l5.get(team_id, {}),
-        "recent_l10":  base_l10.get(team_id, {}),
-        "game_logs":   [],
-        "rest":        {"rest_days": 2, "is_b2b": False},
-        "splits":      {"home": {}, "road": {}},
-        "players":     players,
-        "injuries":    team_inj,
+        "team_id":       team_id,
+        "team_abbrev":   abbrev,
+        "team_name":     full_name,
+        "is_home":       is_home,
+        "advanced":      adv_stats.get(team_id, {}),
+        "recent_l5":     base_l5.get(team_id, {}),
+        "recent_l10":    base_l10.get(team_id, {}),
+        "game_logs":     [],
+        "rest":          {"rest_days": 2, "is_b2b": False},
+        "splits":        {"home": home_splits.get(team_id, {}),
+                          "road": road_splits.get(team_id, {})},
+        "players":       players,
+        "injuries":      team_inj,
         "injury_impact": get_injury_impact_score(team_inj, players),
-        "h2h":         [],
+        "h2h":           [],
     }
 
 
@@ -425,11 +409,11 @@ def _synthetic_logs(pdata: dict, n: int = 10) -> list:
 
 
 def _empty_picks():
-    e = {"legs": [], "odds": "N/A", "hitProb": 0, "risks": [], "alts": []}
+    e = {"legs":[], "odds":"N/A", "hitProb":0, "risks":[], "alts":[]}
     return {
-        "safe":  {**e, "key": "safe",  "label": "Safe Multi",     "accentColor": "#4CAF7D"},
-        "mid":   {**e, "key": "mid",   "label": "Mid-Risk Multi", "accentColor": "#C9A84C"},
-        "lotto": {**e, "key": "lotto", "label": "Lotto Multi",    "accentColor": "#E05252"},
+        "safe":  {**e, "key":"safe",  "label":"Safe Multi",     "accentColor":"#4CAF7D"},
+        "mid":   {**e, "key":"mid",   "label":"Mid-Risk Multi", "accentColor":"#C9A84C"},
+        "lotto": {**e, "key":"lotto", "label":"Lotto Multi",    "accentColor":"#E05252"},
     }
 
 
