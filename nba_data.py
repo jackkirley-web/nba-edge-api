@@ -15,7 +15,7 @@ from nba_api.stats.endpoints import (
     leaguedashplayerstats,
 )
 
-CURRENT_SEASON = "2024-25"
+CURRENT_SEASON = "2025-26"
 SEASON_TYPE = "Regular Season"
 SLEEP = 0.6
 
