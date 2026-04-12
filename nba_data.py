@@ -1,4 +1,4 @@
-# nba_data.py — Browser headers + fast timeouts + correct season
+# nba_data.py — Correct nba_api header patching + graceful fallback
 
 import logging
 import time
@@ -7,18 +7,11 @@ from datetime import datetime, date
 
 logger = logging.getLogger(__name__)
 
-from nba_api.stats.endpoints import (
-    leaguegamefinder,
-    leaguedashteamstats,
-    leaguedashplayerstats,
-)
-
 CURRENT_SEASON = "2025-26"
 SEASON_TYPE    = "Regular Season"
 SLEEP          = 0.6
-TIMEOUT        = 15    # Was 30 — fail faster
+TIMEOUT        = 15
 
-# Browser headers — NBA.com blocks requests without these
 NBA_HEADERS = {
     "Host":               "stats.nba.com",
     "User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -32,27 +25,45 @@ NBA_HEADERS = {
     "Origin":             "https://www.nba.com",
 }
 
+
+def _patch_nba_api_headers():
+    """
+    The correct way to set headers in nba_api is to patch the
+    NBAStatsHTTP class headers dict directly before any calls.
+    Passing headers= as a kwarg to endpoints is ignored.
+    """
+    try:
+        from nba_api.stats.library.http import NBAStatsHTTP
+        NBAStatsHTTP.headers = NBA_HEADERS.copy()
+        logger.info("nba_api headers patched successfully")
+    except Exception as e:
+        logger.warning("Could not patch nba_api headers: %s", e)
+
+
+# Patch immediately at import time
+_patch_nba_api_headers()
+
+# Now import endpoints AFTER patching
+from nba_api.stats.endpoints import (
+    leaguegamefinder,
+    leaguedashteamstats,
+    leaguedashplayerstats,
+)
+
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 NBA_CDN   = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
 
 
 def safe_call(fn, *args, retries=2, **kwargs):
-    """Call nba_api with browser headers. 2 retries max, fail fast."""
+    """Call nba_api endpoint. Retries once on failure, fails fast."""
     for attempt in range(retries):
         try:
             time.sleep(SLEEP)
-            return fn(*args, timeout=TIMEOUT, headers=NBA_HEADERS, **kwargs)
-        except TypeError:
-            # nba_api version doesn't accept headers — try without
-            try:
-                time.sleep(SLEEP)
-                return fn(*args, timeout=TIMEOUT, **kwargs)
-            except Exception as e:
-                logger.warning("NBA API call failed (attempt %d): %s", attempt + 1, e)
+            return fn(*args, timeout=TIMEOUT, **kwargs)
         except Exception as e:
             logger.warning("NBA API call failed (attempt %d): %s", attempt + 1, e)
             if attempt < retries - 1:
-                time.sleep(2)
+                time.sleep(3)
     return None
 
 
@@ -86,12 +97,12 @@ def _fetch_espn_schedule(target_date: date) -> list:
             competitors = comp.get("competitors", [])
             home = next((c for c in competitors if c.get("homeAway") == "home"), {})
             away = next((c for c in competitors if c.get("homeAway") == "away"), {})
-            home_team = home.get("team", {})
-            away_team = away.get("team", {})
+            home_team   = home.get("team", {})
+            away_team   = away.get("team", {})
             home_abbrev = home_team.get("abbreviation", "")
             away_abbrev = away_team.get("abbreviation", "")
-            status   = comp.get("status", {}).get("type", {}).get("description", "Scheduled")
-            game_time = ev.get("date", "")
+            status      = comp.get("status", {}).get("type", {}).get("description", "Scheduled")
+            game_time   = ev.get("date", "")
             try:
                 dt = datetime.fromisoformat(game_time.replace("Z", "+00:00"))
                 display_time = dt.strftime("%-I:%M %p ET")
@@ -178,7 +189,6 @@ def _espn_to_nba_id(abbrev: str) -> int:
 # ─── TEAM STATS ───────────────────────────────────────────────
 
 def get_all_team_stats_batch(measure_type="Advanced", location=None, last_n=None):
-    """Fetch stats for all 30 teams in one API call."""
     kwargs = dict(
         season=CURRENT_SEASON,
         season_type_all_star=SEASON_TYPE,
@@ -226,7 +236,7 @@ def get_all_team_stats_batch(measure_type="Advanced", location=None, last_n=None
                     measure_type, location, last_n, len(stats))
         return stats
     except Exception as e:
-        logger.warning("get_all_team_stats_batch failed: %s", e)
+        logger.warning("get_all_team_stats_batch parse failed: %s", e)
         return {}
 
 
@@ -235,7 +245,6 @@ def get_all_team_recent_batch(last_n: int):
 
 
 def get_all_player_stats_batch():
-    """Player advanced stats for all players in one call."""
     result = safe_call(
         leaguedashplayerstats.LeagueDashPlayerStats,
         season=CURRENT_SEASON,
