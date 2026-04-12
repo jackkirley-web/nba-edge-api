@@ -1,19 +1,19 @@
-# player_logs.py — Fast fail timeouts to avoid blocking the cache
+# player_logs.py — Fixed: logs explicitly sorted most-recent-first
 
 import logging
 import time
 from nba_api.stats.endpoints import playergamelogs, leaguedashplayerstats
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
 CURRENT_SEASON = "2024-25"
 SEASON_TYPE    = "Regular Season"
-SLEEP          = 0.5   # Between calls
-TIMEOUT        = 10    # Fail fast — was 30s, now 10s
+SLEEP          = 0.5
+TIMEOUT        = 10
 
 
 def safe_call(fn, *args, retries=1, **kwargs):
-    """Single retry only, 10s timeout. Fail fast rather than block for 60s."""
     for attempt in range(retries):
         try:
             time.sleep(SLEEP)
@@ -26,11 +26,6 @@ def safe_call(fn, *args, retries=1, **kwargs):
 
 
 def get_player_game_logs_batch(player_ids: list, last_n: int = 15) -> dict:
-    """
-    Fetch game logs for a list of player IDs.
-    Returns {player_id: [game_log_dicts]}
-    Skips players whose API call fails — doesn't block on retries.
-    """
     results = {}
     total = len(player_ids)
     for i, player_id in enumerate(player_ids):
@@ -55,35 +50,50 @@ def _fetch_player_logs(player_id: int, last_n: int) -> list:
         return []
     try:
         df = result.get_data_frames()[0]
+
         logs = []
         for _, row in df.iterrows():
+            # Parse the game date so we can sort reliably
+            raw_date = str(row.get("GAME_DATE", "") or "")
+            try:
+                parsed_date = datetime.strptime(raw_date[:10], "%Y-%m-%d")
+            except Exception:
+                parsed_date = datetime.min
+
             logs.append({
-                "game_id":    row.get("GAME_ID"),
-                "game_date":  str(row.get("GAME_DATE", "")),
-                "matchup":    row.get("MATCHUP", ""),
-                "is_home":    "vs." in str(row.get("MATCHUP", "")),
-                "win":        row.get("WL", "") == "W",
-                "mins":       float(row.get("MIN", 0) or 0),
-                "pts":        int(row.get("PTS",  0) or 0),
-                "reb":        int(row.get("REB",  0) or 0),
-                "ast":        int(row.get("AST",  0) or 0),
-                "3pm":        int(row.get("FG3M", 0) or 0),
-                "stl":        int(row.get("STL",  0) or 0),
-                "blk":        int(row.get("BLK",  0) or 0),
-                "tov":        int(row.get("TOV",  0) or 0),
-                "plus_minus": float(row.get("PLUS_MINUS", 0) or 0),
+                "game_id":     row.get("GAME_ID"),
+                "game_date":   raw_date,
+                "parsed_date": parsed_date,   # used for sorting only
+                "matchup":     row.get("MATCHUP", ""),
+                "is_home":     "vs." in str(row.get("MATCHUP", "")),
+                "win":         row.get("WL", "") == "W",
+                "mins":        float(row.get("MIN",  0) or 0),
+                "pts":         int(row.get("PTS",  0) or 0),
+                "reb":         int(row.get("REB",  0) or 0),
+                "ast":         int(row.get("AST",  0) or 0),
+                "3pm":         int(row.get("FG3M", 0) or 0),
+                "stl":         int(row.get("STL",  0) or 0),
+                "blk":         int(row.get("BLK",  0) or 0),
+                "tov":         int(row.get("TOV",  0) or 0),
+                "plus_minus":  float(row.get("PLUS_MINUS", 0) or 0),
             })
+
+        # ── CRITICAL: sort most-recent first ─────────────────
+        # nba_api does not guarantee date order — must sort explicitly
+        logs.sort(key=lambda g: g["parsed_date"], reverse=True)
+
+        # Remove the helper field before returning
+        for log in logs:
+            del log["parsed_date"]
+
         return logs
+
     except Exception as e:
         logger.warning("Failed to parse logs for player %d: %s", player_id, e)
         return []
 
 
 def get_all_player_base_stats() -> dict:
-    """
-    Single batch call — season averages for all players.
-    Returns {player_id: {name, team_id, pts, reb, ast, 3pm, stl, blk, mins, ...}}
-    """
     result = safe_call(
         leaguedashplayerstats.LeagueDashPlayerStats,
         season=CURRENT_SEASON,
