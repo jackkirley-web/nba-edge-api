@@ -8,9 +8,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ─── POSITION DEFENSIVE RATINGS ───────────────────────────────
-# How much each position typically scores vs league average
-# Used to adjust projections based on opponent matchup
+# ─── POSITION DEFENSIVE RATINGS ───────────────────────────────────────────────
 POSITION_FACTORS = {
     "PG":  {"pts": 1.0, "reb": 0.85, "ast": 1.1,  "3pm": 1.05, "stl": 1.05, "blk": 0.7},
     "SG":  {"pts": 1.0, "reb": 0.85, "ast": 0.9,  "3pm": 1.05, "stl": 1.0,  "blk": 0.7},
@@ -23,10 +21,8 @@ POSITION_FACTORS = {
     "F-C": {"pts": 1.0, "reb": 1.15, "ast": 0.75, "3pm": 0.7,  "stl": 0.8,  "blk": 1.2},
 }
 
-# How much bookmakers typically shade lines from season average
-# (books shade slightly toward the under on most props)
 BOOK_LINE_SHADING = {
-    "pts":  -0.5,   # Book line typically 0.5 below season avg
+    "pts":  -0.5,
     "reb":  -0.3,
     "ast":  -0.3,
     "3pm":  -0.2,
@@ -37,7 +33,6 @@ BOOK_LINE_SHADING = {
     "pa":   -0.5,
 }
 
-# Standard deviations for each stat type (used for volatility)
 STAT_STD_DEVS = {
     "pts":  5.5,
     "reb":  2.8,
@@ -53,10 +48,10 @@ STAT_STD_DEVS = {
 
 def project_player_props(
     player: dict,
-    game_logs: list,          # Last 15 game logs for this player
-    opp_advanced: dict,       # Opponent's defensive stats
-    home_ctx: dict,           # Home team context
-    away_ctx: dict,           # Away team context
+    game_logs: list,
+    opp_advanced: dict,
+    home_ctx: dict,
+    away_ctx: dict,
     player_is_home: bool,
     injury_status: str = "Available",
     teammate_injuries: list = None,
@@ -75,10 +70,9 @@ def project_player_props(
     usage = player.get("usage_rate", 0.20)
     season_mins = player.get("minutes", 28.0)
 
-    if season_mins < 8:  # Not a real rotation player
+    if season_mins < 8:
         return None
 
-    # ── Minutes projection ────────────────────────────────────
     projected_mins = _project_minutes(
         season_mins, player_is_home,
         injury_status, teammate_injuries or [],
@@ -87,12 +81,10 @@ def project_player_props(
 
     mins_factor = projected_mins / max(season_mins, 1)
 
-    # ── Rolling averages ──────────────────────────────────────
     l5  = _avg_logs(game_logs[-5:])
     l10 = _avg_logs(game_logs[-10:])
     l15 = _avg_logs(game_logs)
 
-    # Blended projection (40% L5, 35% L10, 25% L15)
     blended = {}
     for stat in ["pts", "reb", "ast", "3pm", "stl", "blk"]:
         blended[stat] = (
@@ -101,60 +93,44 @@ def project_player_props(
             0.25 * l15.get(stat, 0)
         )
 
-    # ── Pace adjustment ───────────────────────────────────────
     team_ctx = home_ctx if player_is_home else away_ctx
     opp_ctx  = away_ctx if player_is_home else home_ctx
     team_pace = team_ctx.get("advanced", {}).get("pace", 100)
     opp_pace  = opp_ctx.get("advanced",  {}).get("pace", 100)
     avg_pace  = (team_pace + opp_pace) / 2
-    pace_factor = avg_pace / 100.0  # 1.0 = league average
+    pace_factor = avg_pace / 100.0
 
-    # ── Matchup factor ────────────────────────────────────────
     pos_key = position.split("-")[0] if "-" in position else position
     pos_factors = POSITION_FACTORS.get(pos_key, POSITION_FACTORS["G"])
 
-    # Opponent defensive rating vs position
     opp_def_rating = opp_advanced.get("def_rating", 110)
-    # Better defense (lower rating) = harder matchup
-    def_factor = opp_def_rating / 110.0  # >1 = weak defense, <1 = strong defense
+    def_factor = opp_def_rating / 110.0
 
-    # ── B2B and fatigue ───────────────────────────────────────
     team_rest = team_ctx.get("rest", {})
     fatigue_factor = 0.93 if team_rest.get("is_b2b") else 1.0
 
-    # ── Teammate injury usage bump ────────────────────────────
-    # If a key teammate is out, usage redistributes
     usage_bump = _calc_usage_bump(player, teammate_injuries or [], team_ctx)
 
-    # ── Apply all adjustments to each stat ────────────────────
     projections = {}
     for stat in ["pts", "reb", "ast", "3pm", "stl", "blk"]:
         base = blended[stat]
-
-        # Apply minutes scaling
         proj = base * mins_factor
 
-        # Apply pace factor (most stats scale with pace)
         if stat in ["pts", "reb", "ast", "3pm"]:
             proj *= pace_factor
 
-        # Apply position-based matchup factor
         proj *= pos_factors.get(stat, 1.0)
 
-        # Apply defensive rating factor
         if stat == "pts":
             proj *= def_factor
         elif stat in ["reb", "ast"]:
-            proj *= (def_factor * 0.5 + 0.5)  # Partial effect
+            proj *= (def_factor * 0.5 + 0.5)
 
-        # Apply fatigue
         proj *= fatigue_factor
 
-        # Apply usage bump from teammate injuries
         if stat in ["pts", "ast", "3pm"]:
             proj *= (1 + usage_bump)
 
-        # Injury status penalty
         if injury_status == "Questionable":
             proj *= 0.90
         elif injury_status == "Probable":
@@ -162,34 +138,26 @@ def project_player_props(
 
         projections[stat] = round(proj, 1)
 
-    # ── Combo projections ─────────────────────────────────────
     projections["pra"] = round(projections["pts"] + projections["reb"] + projections["ast"], 1)
     projections["pr"]  = round(projections["pts"] + projections["reb"], 1)
     projections["pa"]  = round(projections["pts"] + projections["ast"], 1)
     projections["ra"]  = round(projections["reb"] + projections["ast"], 1)
 
-    # ── Double/Triple double probability ──────────────────────
-    projections["dd_prob"]  = _calc_dd_probability(projections, game_logs)
-    projections["td_prob"]  = _calc_td_probability(projections, game_logs)
+    projections["dd_prob"] = _calc_dd_probability(projections, game_logs)
+    projections["td_prob"] = _calc_td_probability(projections, game_logs)
 
-    # ── Estimated book lines ───────────────────────────────────
-    # We estimate what the bookmaker would set the line at
     est_lines = {}
     for stat, shade in BOOK_LINE_SHADING.items():
         if stat in projections:
-            # Round to nearest 0.5 (how books set lines)
             raw = projections[stat] + shade
             est_lines[stat] = round(raw * 2) / 2
 
-    # ── Edge calculation ──────────────────────────────────────
-    # Edge = how much our projection beats the estimated line
     edges = {}
     for stat in est_lines:
         if stat in projections and est_lines[stat] > 0:
             edge = projections[stat] - est_lines[stat]
             edges[stat] = round(edge, 1)
 
-    # ── Score each prop ────────────────────────────────────────
     scored_props = []
     for stat in ["pts", "reb", "ast", "3pm", "stl", "blk", "pra", "pr", "pa"]:
         if stat not in projections or stat not in est_lines:
@@ -203,10 +171,8 @@ def project_player_props(
         if est_line <= 0:
             continue
 
-        # Normalised edge in standard deviation units
         norm_edge = edge / std_dev
 
-        # Confidence score
         confidence = _score_prop(
             norm_edge, usage, projected_mins, season_mins,
             injury_status, def_factor, pace_factor,
@@ -216,10 +182,8 @@ def project_player_props(
         if confidence < 50:
             continue
 
-        # Direction: Over if projection > line, Under otherwise
         direction = "Over" if edge > 0 else "Under"
 
-        # Only show if there's meaningful edge
         if abs(edge) < 0.3:
             continue
 
@@ -253,7 +217,6 @@ def project_player_props(
                             ),
         })
 
-    # Add DD/TD if probability is interesting
     if projections["dd_prob"] >= 0.25:
         scored_props.append({
             "player":       name,
@@ -312,10 +275,9 @@ def project_player_props(
     }
 
 
-# ─── HELPER FUNCTIONS ─────────────────────────────────────────
+# ─── HELPER FUNCTIONS ─────────────────────────────────────────────────────────
 
 def _avg_logs(logs: list) -> dict:
-    """Average stats across a list of game logs."""
     if not logs:
         return {}
     stats = ["pts", "reb", "ast", "3pm", "stl", "blk"]
@@ -326,60 +288,39 @@ def _avg_logs(logs: list) -> dict:
     return result
 
 
-def _project_minutes(
-    season_mins: float,
-    is_home: bool,
-    injury_status: str,
-    teammate_injuries: list,
-    team_ctx: dict,
-) -> float:
-    """Project minutes for tonight accounting for all factors."""
+def _project_minutes(season_mins, is_home, injury_status, teammate_injuries, team_ctx):
     mins = season_mins
-
-    # Home teams historically play starters slightly more
     if is_home:
         mins *= 1.01
-
-    # B2B — coaches typically reduce minutes
     if team_ctx.get("rest", {}).get("is_b2b"):
         mins *= 0.94
-
-    # Injury status
     if injury_status == "Questionable":
-        mins *= 0.85  # Might be limited or not play full game
+        mins *= 0.85
     elif injury_status == "Probable":
         mins *= 0.97
-
-    # Teammate out — more minutes for others
     key_teammates_out = sum(
         1 for p in teammate_injuries
         if p.get("status") == "Out" and p.get("usage_rate", 0) >= 0.18
     )
     mins *= (1 + key_teammates_out * 0.04)
+    return min(mins, 40.0)
 
-    return min(mins, 40.0)  # Cap at 40 minutes
 
-
-def _calc_usage_bump(player: dict, teammate_injuries: list, team_ctx: dict) -> float:
-    """Calculate usage rate increase when key teammates are out."""
+def _calc_usage_bump(player, teammate_injuries, team_ctx):
     bump = 0.0
     for injured in teammate_injuries:
         if injured.get("status") == "Out":
             injured_usage = injured.get("usage_rate", 0)
-            # Usage redistributes proportionally
-            # Simplified: this player gets ~20-30% of the lost usage
             bump += injured_usage * 0.25
-    return min(bump, 0.12)  # Cap at 12% bump
+    return min(bump, 0.12)
 
 
-def _calc_dd_probability(projections: dict, game_logs: list) -> float:
-    """Estimate double double probability from projections and history."""
-    pts  = projections.get("pts", 0)
-    reb  = projections.get("reb", 0)
-    ast  = projections.get("ast", 0)
-    blk  = projections.get("blk", 0)
+def _calc_dd_probability(projections, game_logs):
+    pts = projections.get("pts", 0)
+    reb = projections.get("reb", 0)
+    ast = projections.get("ast", 0)
+    blk = projections.get("blk", 0)
 
-    # Count historical DDs
     historical_dd = sum(
         1 for g in game_logs
         if sum(1 for stat in ["pts", "reb", "ast", "blk", "stl"]
@@ -387,8 +328,6 @@ def _calc_dd_probability(projections: dict, game_logs: list) -> float:
     )
     hist_rate = historical_dd / len(game_logs) if game_logs else 0
 
-    # Model probability based on projections
-    # Probability of hitting 10 in at least 2 categories
     cats_near_10 = sum(1 for v in [pts, reb, ast, blk] if v >= 7)
     cats_at_10   = sum(1 for v in [pts, reb, ast, blk] if v >= 10)
 
@@ -403,12 +342,10 @@ def _calc_dd_probability(projections: dict, game_logs: list) -> float:
     else:
         model_prob = 0.05
 
-    # Blend with historical
     return round(0.6 * model_prob + 0.4 * hist_rate, 3)
 
 
-def _calc_td_probability(projections: dict, game_logs: list) -> float:
-    """Estimate triple double probability."""
+def _calc_td_probability(projections, game_logs):
     pts = projections.get("pts", 0)
     reb = projections.get("reb", 0)
     ast = projections.get("ast", 0)
@@ -435,24 +372,10 @@ def _calc_td_probability(projections: dict, game_logs: list) -> float:
     return round(0.5 * model_prob + 0.5 * hist_rate, 3)
 
 
-def _score_prop(
-    norm_edge: float,
-    usage: float,
-    proj_mins: float,
-    season_mins: float,
-    injury_status: str,
-    def_factor: float,
-    pace_factor: float,
-    sample_size: int,
-    stat: str,
-) -> int:
-    """Score a prop 0-100."""
-    score = 50  # Baseline
-
-    # Edge contribution (max +25)
+def _score_prop(norm_edge, usage, proj_mins, season_mins, injury_status, def_factor, pace_factor, sample_size, stat):
+    score = 50
     score += min(25, norm_edge * 15)
 
-    # Usage rate — higher usage = more reliable
     if usage >= 0.28:
         score += 10
     elif usage >= 0.22:
@@ -462,43 +385,37 @@ def _score_prop(
     else:
         score -= 5
 
-    # Minutes certainty
     mins_pct = proj_mins / max(season_mins, 1)
     if mins_pct >= 0.95:
         score += 5
     elif mins_pct < 0.85:
         score -= 8
 
-    # Injury status penalty
     if injury_status == "Questionable":
         score -= 12
     elif injury_status == "Probable":
         score -= 4
 
-    # Favourable matchup
-    if def_factor > 1.08:  # Weak opponent defense
+    if def_factor > 1.08:
         score += 6
-    elif def_factor < 0.95:  # Strong defense
+    elif def_factor < 0.95:
         score -= 5
 
-    # Pace bonus for counting stats
     if stat in ["pts", "reb", "ast", "pra"] and pace_factor > 1.03:
         score += 4
 
-    # Sample size
     if sample_size < 5:
         score -= 10
     elif sample_size >= 12:
         score += 3
 
-    # Volatility penalty for low-frequency stats
     if stat in ["stl", "blk", "td"]:
         score -= 8
 
     return min(88, max(35, round(score)))
 
 
-def _conf_to_prob(score: int) -> float:
+def _conf_to_prob(score):
     if score >= 80: return 0.68
     if score >= 72: return 0.62
     if score >= 65: return 0.57
@@ -506,7 +423,7 @@ def _conf_to_prob(score: int) -> float:
     return 0.50
 
 
-def _stat_label(stat: str) -> str:
+def _stat_label(stat):
     return {
         "pts": "Points", "reb": "Rebounds", "ast": "Assists",
         "3pm": "3-Pointers Made", "stl": "Steals", "blk": "Blocks",
@@ -533,11 +450,9 @@ def _build_prop_tags(injury_status, rest, usage, proj_mins, season_mins, def_fac
     return tags
 
 
-def _build_prop_reasoning(
-    name, stat, direction, projection, est_line, edge,
-    l5_avg, l10_avg, proj_mins, opp_def_rating, def_factor,
-    rest, injury_status, usage_bump
-):
+def _build_prop_reasoning(name, stat, direction, projection, est_line, edge,
+                           l5_avg, l10_avg, proj_mins, opp_def_rating, def_factor,
+                           rest, injury_status, usage_bump):
     label = _stat_label(stat)
     parts = []
 
@@ -547,9 +462,7 @@ def _build_prop_reasoning(
         f"Edge: {edge:+.1f} — lean {direction}."
     )
 
-    parts.append(
-        f"Recent form: {l5_avg:.1f} L5 avg, {l10_avg:.1f} L10 avg."
-    )
+    parts.append(f"Recent form: {l5_avg:.1f} L5 avg, {l10_avg:.1f} L10 avg.")
 
     if def_factor > 1.08:
         parts.append(
