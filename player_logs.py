@@ -1,4 +1,4 @@
-# player_logs.py — Fixed: logs explicitly sorted most-recent-first
+# player_logs.py — Fixed season to 2025-26
 
 import logging
 import time
@@ -7,7 +7,7 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SEASON = "2024-25"
+CURRENT_SEASON = "2025-26"   # ← FIXED: was 2024-25
 SEASON_TYPE    = "Regular Season"
 SLEEP          = 0.5
 TIMEOUT        = 10
@@ -50,10 +50,8 @@ def _fetch_player_logs(player_id: int, last_n: int) -> list:
         return []
     try:
         df = result.get_data_frames()[0]
-
         logs = []
         for _, row in df.iterrows():
-            # Parse the game date so we can sort reliably
             raw_date = str(row.get("GAME_DATE", "") or "")
             try:
                 parsed_date = datetime.strptime(raw_date[:10], "%Y-%m-%d")
@@ -63,7 +61,7 @@ def _fetch_player_logs(player_id: int, last_n: int) -> list:
             logs.append({
                 "game_id":     row.get("GAME_ID"),
                 "game_date":   raw_date,
-                "parsed_date": parsed_date,   # used for sorting only
+                "parsed_date": parsed_date,
                 "matchup":     row.get("MATCHUP", ""),
                 "is_home":     "vs." in str(row.get("MATCHUP", "")),
                 "win":         row.get("WL", "") == "W",
@@ -78,11 +76,9 @@ def _fetch_player_logs(player_id: int, last_n: int) -> list:
                 "plus_minus":  float(row.get("PLUS_MINUS", 0) or 0),
             })
 
-        # ── CRITICAL: sort most-recent first ─────────────────
-        # nba_api does not guarantee date order — must sort explicitly
+        # Sort most-recent first
         logs.sort(key=lambda g: g["parsed_date"], reverse=True)
 
-        # Remove the helper field before returning
         for log in logs:
             del log["parsed_date"]
 
