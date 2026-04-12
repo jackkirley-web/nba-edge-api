@@ -1,4 +1,4 @@
-# cache.py — Clean version, NBA.com primary, games-only fallback
+# cache.py — resilient cache with stale fallback and 10-player team streak pulls
 
 import logging
 import threading
@@ -6,19 +6,20 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-MAIN_TTL   = 300
+MAIN_TTL = 300
 STREAK_TTL = 1800
+MAX_STREAK_PLAYERS_PER_TEAM = 10  # keep 10 players as requested
 
 
 class MainCache:
     def __init__(self):
-        self._lock         = threading.Lock()
-        self._data         = {}
+        self._lock = threading.RLock()
+        self._data = {}
         self._last_refresh = None
 
-    def get(self, force_refresh=False) -> dict:
+    def get(self, force_refresh: bool = False) -> dict:
         with self._lock:
-            age   = (datetime.now() - self._last_refresh).seconds if self._last_refresh else 9999
+            age = (datetime.now() - self._last_refresh).seconds if self._last_refresh else 9999
             stale = force_refresh or age > MAIN_TTL or not self._data
 
         if stale:
@@ -27,13 +28,13 @@ class MainCache:
                 try:
                     fresh = self._fetch_all()
                     if fresh:
-                        self._data         = fresh
+                        self._data = fresh
                         self._last_refresh = datetime.now()
                         try:
                             from data_store import save_main_data
                             save_main_data(fresh)
-                        except Exception:
-                            pass
+                        except Exception as save_err:
+                            logger.warning("Failed saving main cache to disk: %s", save_err)
                     else:
                         if not self._data:
                             self._data = self._from_disk() or self._games_only()
@@ -49,11 +50,13 @@ class MainCache:
 
     def _fetch_all(self) -> dict:
         from nba_data import (
-            get_today_games, get_all_team_stats_batch,
-            get_all_team_recent_batch, get_all_player_stats_batch,
+            get_today_games,
+            get_all_team_stats_batch,
+            get_all_team_recent_batch,
+            get_all_player_stats_batch,
         )
         from player_logs import get_all_player_base_stats
-        from injury_report import fetch_official_injury_report, get_injury_impact_score
+        from injury_report import fetch_official_injury_report
         from engine import score_spread_leg, score_total_leg, build_multis
         from props_engine import project_player_props
         from odds_fetcher import fetch_odds_for_games
@@ -66,17 +69,28 @@ class MainCache:
             return None
 
         logger.info("League stats...")
-        adv_stats       = get_all_team_stats_batch("Advanced")
-        base_l10        = get_all_team_recent_batch(10)
-        base_l5         = get_all_team_recent_batch(5)
-        home_splits     = get_all_team_stats_batch("Base", location="Home")
-        road_splits     = get_all_team_stats_batch("Base", location="Road")
+        adv_stats = get_all_team_stats_batch("Advanced")
+        base_l10 = get_all_team_recent_batch(10)
+        base_l5 = get_all_team_recent_batch(5)
+        home_splits = get_all_team_stats_batch("Base", location="Home")
+        road_splits = get_all_team_stats_batch("Base", location="Road")
         all_players_adv = get_all_player_stats_batch()
 
         logger.info("Player base stats...")
         player_base = get_all_player_base_stats()
+
         if not player_base:
-            logger.warning("Player base stats empty — falling back to games-only")
+            logger.warning("Player base stats empty — attempting last good disk snapshot")
+            disk = self._from_disk()
+            if disk:
+                disk["_stale"] = True
+                disk["_stale_reason"] = (
+                    "Live NBA stats temporarily unavailable — showing last successful snapshot."
+                )
+                disk["last_updated"] = _now()
+                return disk
+
+            logger.warning("No disk snapshot available — falling back to games-only")
             return None
 
         logger.info("Injuries...")
@@ -88,24 +102,29 @@ class MainCache:
 
         today_team_ids = set()
         for g in games:
-            if g.get("home_team_id"): today_team_ids.add(int(g["home_team_id"]))
-            if g.get("away_team_id"): today_team_ids.add(int(g["away_team_id"]))
+            if g.get("home_team_id"):
+                today_team_ids.add(int(g["home_team_id"]))
+            if g.get("away_team_id"):
+                today_team_ids.add(int(g["away_team_id"]))
 
         today_players = {
-            pid: p for pid, p in player_base.items()
+            pid: p
+            for pid, p in player_base.items()
             if int(p.get("team_id", 0)) in today_team_ids and p.get("mins", 0) >= 10
         }
         logger.info("Rotation players: %d", len(today_players))
 
-        all_legs, all_props, enriched_games = [], [], []
+        all_legs = []
+        all_props = []
+        enriched_games = []
 
         for game in games:
-            home_id     = int(game.get("home_team_id") or 0)
-            away_id     = int(game.get("away_team_id") or 0)
+            home_id = int(game.get("home_team_id") or 0)
+            away_id = int(game.get("away_team_id") or 0)
             home_abbrev = game.get("home_team_abbrev", "")
             away_abbrev = game.get("away_team_abbrev", "")
-            home_name   = (game.get("home_team_city","")+" "+game.get("home_team","")).strip()
-            away_name   = (game.get("away_team_city","")+" "+game.get("away_team","")).strip()
+            home_name = (game.get("home_team_city", "") + " " + game.get("home_team", "")).strip()
+            away_name = (game.get("away_team_city", "") + " " + game.get("away_team", "")).strip()
 
             if not home_id or not away_id:
                 enriched_games.append(game)
@@ -113,88 +132,143 @@ class MainCache:
 
             try:
                 home_ctx = _build_ctx(
-                    home_id, home_abbrev, home_name, True,
-                    adv_stats, base_l5, base_l10, home_splits,
-                    road_splits, all_players_adv, injuries_by_team
+                    home_id,
+                    home_abbrev,
+                    home_name,
+                    True,
+                    adv_stats,
+                    base_l5,
+                    base_l10,
+                    home_splits,
+                    road_splits,
+                    all_players_adv,
+                    injuries_by_team,
                 )
                 away_ctx = _build_ctx(
-                    away_id, away_abbrev, away_name, False,
-                    adv_stats, base_l5, base_l10, home_splits,
-                    road_splits, all_players_adv, injuries_by_team
+                    away_id,
+                    away_abbrev,
+                    away_name,
+                    False,
+                    adv_stats,
+                    base_l5,
+                    base_l10,
+                    home_splits,
+                    road_splits,
+                    all_players_adv,
+                    injuries_by_team,
                 )
 
                 game_odds = odds_by_game.get(game["game_id"], {})
-                enriched_games.append({
-                    **game, **game_odds,
-                    "home_name":     home_name,
-                    "away_name":     away_name,
-                    "home_injuries": home_ctx.get("injuries", []),
-                    "away_injuries": away_ctx.get("injuries", []),
-                })
+                enriched_games.append(
+                    {
+                        **game,
+                        **game_odds,
+                        "home_name": home_name,
+                        "away_name": away_name,
+                        "home_injuries": home_ctx.get("injuries", []),
+                        "away_injuries": away_ctx.get("injuries", []),
+                    }
+                )
 
                 label = f"{away_abbrev} @ {home_abbrev}"
 
                 if game_odds.get("spread_line") is not None:
-                    line     = game_odds["spread_line"]
+                    line = game_odds["spread_line"]
                     home_fav = line < 0
-                    sr  = score_spread_leg(home_ctx, away_ctx, abs(line), home_fav,
-                                           game_odds.get("spread_odds", 1.91))
+                    sr = score_spread_leg(
+                        home_ctx,
+                        away_ctx,
+                        abs(line),
+                        home_fav,
+                        game_odds.get("spread_odds", 1.91),
+                    )
                     sel = f"{home_abbrev} {line:+.1f}" if home_fav else f"{away_abbrev} +{abs(line):.1f}"
-                    all_legs.append({**sr, "game_id": game["game_id"],
-                        "game": label, "selection": sel,
-                        "odds": game_odds.get("spread_odds", 1.91)})
+                    all_legs.append(
+                        {
+                            **sr,
+                            "game_id": game["game_id"],
+                            "game": label,
+                            "selection": sel,
+                            "odds": game_odds.get("spread_odds", 1.91),
+                        }
+                    )
 
                 if game_odds.get("total_line") is not None:
                     tl = game_odds["total_line"]
-                    tr = score_total_leg(home_ctx, away_ctx, tl,
-                                         game_odds.get("total_odds", 1.91))
-                    all_legs.append({**tr, "game_id": game["game_id"],
-                        "game": label,
-                        "selection": f"{tr['selection_direction']} {tl}",
-                        "odds": game_odds.get("total_odds", 1.91)})
-
-                for is_home, tid, tname, ta in [
-                    (True, home_id, home_name, home_abbrev),
-                    (False, away_id, away_name, away_abbrev),
-                ]:
-                    tc      = home_ctx if is_home else away_ctx
-                    oc      = away_ctx if is_home else home_ctx
-                    inj_map = {p["name"].lower(): p["status"] for p in tc["injuries"]}
-                    tpids   = sorted(
-                        [pid for pid, p in today_players.items()
-                         if int(p.get("team_id", 0)) == tid],
-                        key=lambda pid: today_players[pid].get("mins", 0), reverse=True
+                    tr = score_total_leg(
+                        home_ctx,
+                        away_ctx,
+                        tl,
+                        game_odds.get("total_odds", 1.91),
                     )
+                    all_legs.append(
+                        {
+                            **tr,
+                            "game_id": game["game_id"],
+                            "game": label,
+                            "selection": f"{tr['selection_direction']} {tl}",
+                            "odds": game_odds.get("total_odds", 1.91),
+                        }
+                    )
+
+                for is_home, tid, team_abbrev in [
+                    (True, home_id, home_abbrev),
+                    (False, away_id, away_abbrev),
+                ]:
+                    tc = home_ctx if is_home else away_ctx
+                    oc = away_ctx if is_home else home_ctx
+                    inj_map = {p["name"].lower(): p["status"] for p in tc["injuries"]}
+
+                    tpids = sorted(
+                        [
+                            pid
+                            for pid, p in today_players.items()
+                            if int(p.get("team_id", 0)) == tid
+                        ],
+                        key=lambda pid: today_players[pid].get("mins", 0),
+                        reverse=True,
+                    )
+
                     for pid in tpids[:10]:
                         pdata = today_players[pid]
-                        inj   = inj_map.get(pdata["name"].lower(), "Available")
+                        inj = inj_map.get(pdata["name"].lower(), "Available")
                         if inj == "Out":
                             continue
+
                         tadv = all_players_adv.get(tid, [])
-                        am   = next((p for p in tadv if p["name"] == pdata["name"]), {})
-                        pd   = {**pdata,
-                                "usage_rate": am.get("usage_rate", 0.15),
-                                "minutes":    pdata.get("mins", 20.0),
-                                "position":   pdata.get("position", "G")}
+                        am = next((p for p in tadv if p["name"] == pdata["name"]), {})
+                        pd = {
+                            **pdata,
+                            "usage_rate": am.get("usage_rate", 0.15),
+                            "minutes": pdata.get("mins", 20.0),
+                            "position": pdata.get("position", "G"),
+                        }
+
                         try:
                             pr = project_player_props(
                                 player=pd,
                                 game_logs=_synthetic_logs(pdata),
                                 opp_advanced=oc["advanced"],
-                                home_ctx=home_ctx, away_ctx=away_ctx,
+                                home_ctx=home_ctx,
+                                away_ctx=away_ctx,
                                 player_is_home=is_home,
                                 injury_status=inj,
                                 teammate_injuries=tc["injuries"],
                             )
                             if pr and pr.get("scored_props"):
                                 for prop in pr["scored_props"]:
-                                    all_props.append({**prop,
-                                        "game_id": game["game_id"],
-                                        "game": label, "team": ta,
-                                        "player_id": pid,
-                                        "is_bench": pdata.get("mins", 0) < 28})
-                        except Exception:
-                            pass
+                                    all_props.append(
+                                        {
+                                            **prop,
+                                            "game_id": game["game_id"],
+                                            "game": label,
+                                            "team": team_abbrev,
+                                            "player_id": pid,
+                                            "is_bench": pdata.get("mins", 0) < 28,
+                                        }
+                                    )
+                        except Exception as prop_err:
+                            logger.warning("Prop scoring failed for %s: %s", pdata.get("name"), prop_err)
 
             except Exception as e:
                 logger.warning("Game failed %s: %s", game.get("game_id"), e)
@@ -206,45 +280,55 @@ class MainCache:
         for p in sorted(all_props, key=lambda x: x.get("confidence", 0), reverse=True)[:12]:
             if p.get("confidence", 0) >= 62 and p.get("est_line") is not None:
                 sel = f"{p['player']} {p['direction']} {p['est_line']} {p['stat_label']}"
-                top_prop_legs.append({
-                    "game_id": p["game_id"], "game": p["game"],
-                    "type": "Prop — "+p["stat_label"], "selection": sel,
-                    "odds": 1.91, "confidence": p["confidence"], "prob": p["prob"],
-                    "tags": p.get("tags",[]), "reasoning": p.get("reasoning",""),
-                    "factors":[], "projected_margin":None, "projected_total":None,
-                    "edge": p.get("edge"),
-                })
+                top_prop_legs.append(
+                    {
+                        "game_id": p["game_id"],
+                        "game": p["game"],
+                        "type": "Prop — " + p["stat_label"],
+                        "selection": sel,
+                        "odds": 1.91,
+                        "confidence": p["confidence"],
+                        "prob": p["prob"],
+                        "tags": p.get("tags", []),
+                        "reasoning": p.get("reasoning", ""),
+                        "factors": [],
+                        "projected_margin": None,
+                        "projected_total": None,
+                        "edge": p.get("edge"),
+                    }
+                )
 
         picks = build_multis(all_legs + top_prop_legs)
         all_props.sort(key=lambda x: x.get("confidence", 0), reverse=True)
 
         return {
-            "games":           enriched_games,
-            "legs":            all_legs,
-            "props":           all_props,
-            "picks":           picks,
-            "injuries":        injuries_by_team,
-            "last_updated":    _now(),
-            "games_analyzed":  len(games),
-            "props_scored":    len(all_props),
-            "legs_scored":     len(all_legs),
-            "_stale":          False,
-            "_stale_reason":   "",
-            "_today_players":  today_players,
+            "games": enriched_games,
+            "legs": all_legs,
+            "props": all_props,
+            "picks": picks,
+            "injuries": injuries_by_team,
+            "last_updated": _now(),
+            "games_analyzed": len(games),
+            "props_scored": len(all_props),
+            "legs_scored": len(all_legs),
+            "_stale": False,
+            "_stale_reason": "",
+            "_today_players": today_players,
             "_today_team_ids": today_team_ids,
         }
 
     def _from_disk(self) -> dict:
         try:
             from data_store import load_main_data, get_data_age_str
+
             data = load_main_data()
             if data:
                 age = get_data_age_str()
-                data["_stale"]        = True
+                data["_stale"] = True
                 data["_stale_reason"] = f"Showing cached data from {age}"
                 return data
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Disk fallback failed: %s", e)
         return {}
 
     def _games_only(self) -> dict:
@@ -253,61 +337,84 @@ class MainCache:
             from nba_data import get_today_games
             from odds_fetcher import fetch_odds_for_games
             from engine import build_multis
-            games    = get_today_games() or []
-            odds     = fetch_odds_for_games(games) if games else {}
-            enriched = [{**g, **odds.get(g["game_id"], {}),
-                         "home_injuries":[], "away_injuries":[]}
-                        for g in games]
+
+            games = get_today_games() or []
+            odds = fetch_odds_for_games(games) if games else {}
+            enriched = [
+                {
+                    **g,
+                    **odds.get(g["game_id"], {}),
+                    "home_injuries": [],
+                    "away_injuries": [],
+                }
+                for g in games
+            ]
+
             return {
-                "games": enriched, "legs": [], "props": [],
+                "games": enriched,
+                "legs": [],
+                "props": [],
                 "picks": build_multis([]),
-                "injuries": {}, "last_updated": _now(),
-                "games_analyzed": len(games), "props_scored": 0, "legs_scored": 0,
+                "injuries": {},
+                "last_updated": _now(),
+                "games_analyzed": len(games),
+                "props_scored": 0,
+                "legs_scored": 0,
                 "_stale": True,
-                "_stale_reason": "Player stats unavailable — showing games and odds only. NBA.com may be temporarily down.",
-                "_today_players": {}, "_today_team_ids": set(),
+                "_stale_reason": (
+                    "Player stats unavailable — showing games and odds only. "
+                    "NBA.com may be temporarily down."
+                ),
+                "_today_players": {},
+                "_today_team_ids": set(),
             }
         except Exception as e:
             logger.error("Games-only fallback failed: %s", e)
             return {
-                "games":[], "picks":_empty_picks(), "injuries":{},
-                "legs":[], "props":[], "last_updated":_now(),
-                "games_analyzed":0, "props_scored":0, "legs_scored":0,
+                "games": [],
+                "picks": _empty_picks(),
+                "injuries": {},
+                "legs": [],
+                "props": [],
+                "last_updated": _now(),
+                "games_analyzed": 0,
+                "props_scored": 0,
+                "legs_scored": 0,
                 "_stale": True,
                 "_stale_reason": "Data temporarily unavailable. Please refresh in a few minutes.",
-                "_today_players":{}, "_today_team_ids":set(),
+                "_today_players": {},
+                "_today_team_ids": set(),
             }
 
 
 class StreakCache:
     def __init__(self):
-        self._lock         = threading.Lock()
-        self._data         = []
+        self._lock = threading.Lock()
+        self._data = []
         self._last_refresh = None
-        self._loading      = False
+        self._loading = False
 
-    def get(self, force_refresh=False) -> dict:
+    def get(self, force_refresh: bool = False) -> dict:
         with self._lock:
-            age   = (datetime.now() - self._last_refresh).seconds if self._last_refresh else 9999
+            age = (datetime.now() - self._last_refresh).seconds if self._last_refresh else 9999
             stale = age > STREAK_TTL or not self._last_refresh
             start = (force_refresh or stale) and not self._loading
 
-        if start:
-            with self._lock:
+            if start:
                 if not self._data:
                     try:
                         from data_store import load_streak_data
                         disk = load_streak_data()
                         if disk:
                             self._data = disk
-                    except Exception:
-                        pass
-            self._start_bg()
+                    except Exception as load_err:
+                        logger.warning("Failed loading streak cache from disk: %s", load_err)
 
-        with self._lock:
+                self._start_bg()
+
             return {
-                "streaks":      self._data,
-                "loading":      self._loading,
+                "streaks": self._data,
+                "loading": self._loading,
                 "last_updated": self._last_refresh.strftime("%I:%M %p") if self._last_refresh else None,
             }
 
@@ -316,6 +423,7 @@ class StreakCache:
             if self._loading:
                 return
             self._loading = True
+
         threading.Thread(target=self._bg_fetch, daemon=True).start()
         logger.info("Streak background fetch started")
 
@@ -323,9 +431,16 @@ class StreakCache:
         try:
             from player_logs import get_player_game_logs_batch
             from streak_engine import calculate_streaks
-            main          = cache.get()
+
+            main = cache.get()
             today_players = main.get("_today_players", {})
-            team_ids      = main.get("_today_team_ids", set())
+            team_ids = main.get("_today_team_ids", set())
+
+            if main.get("_stale"):
+                logger.warning("Streak fetch skipped because main cache is stale")
+                with self._lock:
+                    self._loading = False
+                return
 
             if not today_players:
                 logger.warning("Streak fetch: no players in main cache")
@@ -336,15 +451,20 @@ class StreakCache:
             fetch_ids = []
             for tid in team_ids:
                 tp = sorted(
-                    [(pid, p) for pid, p in today_players.items()
-                     if int(p.get("team_id", 0)) == tid],
-                    key=lambda x: x[1].get("mins", 0), reverse=True
+                    [
+                        (pid, p)
+                        for pid, p in today_players.items()
+                        if int(p.get("team_id", 0)) == tid
+                    ],
+                    key=lambda x: x[1].get("mins", 0),
+                    reverse=True,
                 )
-                fetch_ids.extend([pid for pid, _ in tp[:10]])
+                fetch_ids.extend([pid for pid, _ in tp[:MAX_STREAK_PLAYERS_PER_TEAM]])
 
             logger.info("Streak: fetching logs for %d players", len(fetch_ids))
-            logs    = get_player_game_logs_batch(fetch_ids, last_n=15)
+            logs = get_player_game_logs_batch(fetch_ids, last_n=15)
             logger.info("Streak: got logs for %d players", len(logs))
+
             streaks = calculate_streaks(
                 player_base=today_players,
                 player_logs=logs,
@@ -354,15 +474,15 @@ class StreakCache:
             logger.info("Streak: %d entries", len(streaks))
 
             with self._lock:
-                self._data         = streaks
+                self._data = streaks
                 self._last_refresh = datetime.now()
-                self._loading      = False
+                self._loading = False
 
             try:
                 from data_store import save_streak_data
                 save_streak_data(streaks)
-            except Exception:
-                pass
+            except Exception as save_err:
+                logger.warning("Failed saving streak data: %s", save_err)
 
         except Exception as e:
             logger.error("Streak fetch failed: %s", e)
@@ -370,50 +490,66 @@ class StreakCache:
                 self._loading = False
 
 
-def _build_ctx(team_id, abbrev, full_name, is_home,
-               adv_stats, base_l5, base_l10, home_splits,
-               road_splits, all_players_adv, injuries_by_team):
+def _build_ctx(
+    team_id,
+    abbrev,
+    full_name,
+    is_home,
+    adv_stats,
+    base_l5,
+    base_l10,
+    home_splits,
+    road_splits,
+    all_players_adv,
+    injuries_by_team,
+):
     from injury_report import get_injury_impact_score
-    players  = all_players_adv.get(team_id, [])
-    team_inj = (injuries_by_team.get(full_name)
-                or injuries_by_team.get(abbrev) or [])
+
+    players = all_players_adv.get(team_id, [])
+    team_inj = (injuries_by_team.get(full_name) or injuries_by_team.get(abbrev) or [])
+
     return {
-        "team_id":       team_id,
-        "team_abbrev":   abbrev,
-        "team_name":     full_name,
-        "is_home":       is_home,
-        "advanced":      adv_stats.get(team_id, {}),
-        "recent_l5":     base_l5.get(team_id, {}),
-        "recent_l10":    base_l10.get(team_id, {}),
-        "game_logs":     [],
-        "rest":          {"rest_days": 2, "is_b2b": False},
-        "splits":        {"home": home_splits.get(team_id, {}),
-                          "road": road_splits.get(team_id, {})},
-        "players":       players,
-        "injuries":      team_inj,
+        "team_id": team_id,
+        "team_abbrev": abbrev,
+        "team_name": full_name,
+        "is_home": is_home,
+        "advanced": adv_stats.get(team_id, {}),
+        "recent_l5": base_l5.get(team_id, {}),
+        "recent_l10": base_l10.get(team_id, {}),
+        "game_logs": [],
+        "rest": {"rest_days": 2, "is_b2b": False},
+        "splits": {
+            "home": home_splits.get(team_id, {}),
+            "road": road_splits.get(team_id, {}),
+        },
+        "players": players,
+        "injuries": team_inj,
         "injury_impact": get_injury_impact_score(team_inj, players),
-        "h2h":           [],
+        "h2h": [],
     }
 
 
 def _synthetic_logs(pdata: dict, n: int = 10) -> list:
     import random
-    base = {s: pdata.get(s, 0) for s in ["pts","reb","ast","3pm","stl","blk"]}
+
+    base = {s: pdata.get(s, 0) for s in ["pts", "reb", "ast", "3pm", "stl", "blk"]}
     logs = []
     for _ in range(n):
-        log = {stat: max(0, round(avg + random.uniform(-avg*0.15, avg*0.15)))
-               for stat, avg in base.items()}
+        log = {
+            stat: max(0, round(avg + random.uniform(-avg * 0.15, avg * 0.15)))
+            for stat, avg in base.items()
+        }
         log["mins"] = pdata.get("mins", 20.0)
         logs.append(log)
     return logs
 
 
 def _empty_picks():
-    e = {"legs":[], "odds":"N/A", "hitProb":0, "risks":[], "alts":[]}
+    e = {"legs": [], "odds": "N/A", "hitProb": 0, "risks": [], "alts": []}
     return {
-        "safe":  {**e, "key":"safe",  "label":"Safe Multi",     "accentColor":"#4CAF7D"},
-        "mid":   {**e, "key":"mid",   "label":"Mid-Risk Multi", "accentColor":"#C9A84C"},
-        "lotto": {**e, "key":"lotto", "label":"Lotto Multi",    "accentColor":"#E05252"},
+        "safe": {**e, "key": "safe", "label": "Safe Multi", "accentColor": "#4CAF7D"},
+        "mid": {**e, "key": "mid", "label": "Mid-Risk Multi", "accentColor": "#C9A84C"},
+        "lotto": {**e, "key": "lotto", "label": "Lotto Multi", "accentColor": "#E05252"},
     }
 
 
@@ -421,5 +557,5 @@ def _now():
     return datetime.now().strftime("%I:%M %p")
 
 
-cache        = MainCache()
+cache = MainCache()
 streak_cache = StreakCache()
