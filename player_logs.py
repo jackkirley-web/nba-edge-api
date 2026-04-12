@@ -1,4 +1,4 @@
-# player_logs.py — Fetches per-player game logs for prop projections
+# player_logs.py — Fast fail timeouts to avoid blocking the cache
 
 import logging
 import time
@@ -7,34 +7,39 @@ from nba_api.stats.endpoints import playergamelogs, leaguedashplayerstats
 logger = logging.getLogger(__name__)
 
 CURRENT_SEASON = "2024-25"
-SEASON_TYPE = "Regular Season"
-SLEEP = 0.6
+SEASON_TYPE    = "Regular Season"
+SLEEP          = 0.5   # Between calls
+TIMEOUT        = 10    # Fail fast — was 30s, now 10s
 
 
-def safe_call(fn, *args, retries=2, **kwargs):
+def safe_call(fn, *args, retries=1, **kwargs):
+    """Single retry only, 10s timeout. Fail fast rather than block for 60s."""
     for attempt in range(retries):
         try:
             time.sleep(SLEEP)
-            return fn(*args, **kwargs)
+            return fn(*args, timeout=TIMEOUT, **kwargs)
         except Exception as e:
-            logger.warning(f"API call failed (attempt {attempt+1}): {e}")
+            logger.warning("API call failed (attempt %d): %s", attempt + 1, e)
             if attempt < retries - 1:
-                time.sleep(2)
+                time.sleep(1)
     return None
 
 
 def get_player_game_logs_batch(player_ids: list, last_n: int = 15) -> dict:
     """
-    Fetch game logs for multiple players.
+    Fetch game logs for a list of player IDs.
     Returns {player_id: [game_log_dicts]}
-
-    Each game log includes: pts, reb, ast, 3pm, stl, blk, mins, plus_minus
+    Skips players whose API call fails — doesn't block on retries.
     """
     results = {}
-    for player_id in player_ids:
+    total = len(player_ids)
+    for i, player_id in enumerate(player_ids):
+        if i % 20 == 0:
+            logger.info("Fetching logs: %d/%d", i, total)
         logs = _fetch_player_logs(player_id, last_n)
         if logs:
             results[player_id] = logs
+    logger.info("Got logs for %d/%d players", len(results), total)
     return results
 
 
@@ -59,27 +64,25 @@ def _fetch_player_logs(player_id: int, last_n: int) -> list:
                 "is_home":    "vs." in str(row.get("MATCHUP", "")),
                 "win":        row.get("WL", "") == "W",
                 "mins":       float(row.get("MIN", 0) or 0),
-                "pts":        int(row.get("PTS", 0) or 0),
-                "reb":        int(row.get("REB", 0) or 0),
-                "ast":        int(row.get("AST", 0) or 0),
+                "pts":        int(row.get("PTS",  0) or 0),
+                "reb":        int(row.get("REB",  0) or 0),
+                "ast":        int(row.get("AST",  0) or 0),
                 "3pm":        int(row.get("FG3M", 0) or 0),
-                "stl":        int(row.get("STL", 0) or 0),
-                "blk":        int(row.get("BLK", 0) or 0),
-                "tov":        int(row.get("TOV", 0) or 0),
+                "stl":        int(row.get("STL",  0) or 0),
+                "blk":        int(row.get("BLK",  0) or 0),
+                "tov":        int(row.get("TOV",  0) or 0),
                 "plus_minus": float(row.get("PLUS_MINUS", 0) or 0),
-                "fg_pct":     float(row.get("FG_PCT", 0) or 0),
-                "3p_pct":     float(row.get("FG3_PCT", 0) or 0),
             })
         return logs
     except Exception as e:
-        logger.warning(f"Failed to parse logs for player {player_id}: {e}")
+        logger.warning("Failed to parse logs for player %d: %s", player_id, e)
         return []
 
 
 def get_all_player_base_stats() -> dict:
     """
-    Get season averages for all players in one call.
-    Returns {player_id: {pts, reb, ast, 3pm, stl, blk, mins, usage, position, name}}
+    Single batch call — season averages for all players.
+    Returns {player_id: {name, team_id, pts, reb, ast, 3pm, stl, blk, mins, ...}}
     """
     result = safe_call(
         leaguedashplayerstats.LeagueDashPlayerStats,
@@ -96,23 +99,23 @@ def get_all_player_base_stats() -> dict:
         for _, row in df.iterrows():
             pid = int(row.get("PLAYER_ID", 0))
             players[pid] = {
-                "player_id": pid,
-                "name":      row.get("PLAYER_NAME", ""),
-                "team_id":   int(row.get("TEAM_ID", 0)),
+                "player_id":   pid,
+                "name":        row.get("PLAYER_NAME", ""),
+                "team_id":     int(row.get("TEAM_ID", 0)),
                 "team_abbrev": row.get("TEAM_ABBREVIATION", ""),
-                "position":  row.get("START_POSITION", "G") or "G",
-                "mins":      float(row.get("MIN", 0) or 0),
-                "pts":       float(row.get("PTS", 0) or 0),
-                "reb":       float(row.get("REB", 0) or 0),
-                "ast":       float(row.get("AST", 0) or 0),
-                "3pm":       float(row.get("FG3M", 0) or 0),
-                "stl":       float(row.get("STL", 0) or 0),
-                "blk":       float(row.get("BLK", 0) or 0),
-                "tov":       float(row.get("TOV", 0) or 0),
-                "gp":        int(row.get("GP", 0) or 0),
+                "position":    row.get("START_POSITION", "G") or "G",
+                "mins":        float(row.get("MIN",  0) or 0),
+                "pts":         float(row.get("PTS",  0) or 0),
+                "reb":         float(row.get("REB",  0) or 0),
+                "ast":         float(row.get("AST",  0) or 0),
+                "3pm":         float(row.get("FG3M", 0) or 0),
+                "stl":         float(row.get("STL",  0) or 0),
+                "blk":         float(row.get("BLK",  0) or 0),
+                "tov":         float(row.get("TOV",  0) or 0),
+                "gp":          int(row.get("GP", 0) or 0),
             }
-        logger.info(f"Base player stats: {len(players)} players")
+        logger.info("Base player stats: %d players", len(players))
         return players
     except Exception as e:
-        logger.warning(f"get_all_player_base_stats failed: {e}")
+        logger.warning("get_all_player_base_stats failed: %s", e)
         return {}
