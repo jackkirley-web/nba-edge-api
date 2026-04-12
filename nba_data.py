@@ -1,332 +1,328 @@
-# nba_data.py — NBA.com primary, ESPN schedule fallback
-# Correct season: 2025-26, browser headers patched
+# nba_data.py
+# Direct NBA stats request layer with browser headers, serialized requests,
+# fast-fail retries, and optional proxy support via environment variables.
+#
+# Render env vars you can set:
+# NBA_PROXY_URL=http://user:pass@host:port
+# NBA_PROXY_URL_HTTPS=http://user:pass@host:port   (optional, falls back to NBA_PROXY_URL)
+# NBA_DISABLE_PROXY=false
+# NBA_TIMEOUT=12
+# NBA_RETRIES=2
 
 import logging
+import os
+import random
+import threading
 import time
+from datetime import date
+
 import requests
-from datetime import datetime, date
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SEASON = "2025-26"
-SEASON_TYPE    = "Regular Season"
-SLEEP          = 0.6
-TIMEOUT        = 15
+NBA_STATS_BASE = "https://stats.nba.com/stats"
+NBA_SCOREBOARD_URL = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
 
-NBA_HEADERS = {
-    "Host":               "stats.nba.com",
-    "User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept":             "application/json, text/plain, */*",
-    "Accept-Language":    "en-US,en;q=0.9",
-    "Accept-Encoding":    "gzip, deflate, br",
+REQUEST_LOCK = threading.Lock()
+SESSION = requests.Session()
+
+DEFAULT_TIMEOUT = int(os.getenv("NBA_TIMEOUT", "12"))
+DEFAULT_RETRIES = int(os.getenv("NBA_RETRIES", "2"))
+DISABLE_PROXY = os.getenv("NBA_DISABLE_PROXY", "false").lower() == "true"
+
+COMMON_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.nba.com/",
+    "Origin": "https://www.nba.com",
+    "Host": "stats.nba.com",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-AU,en;q=0.9,en-US;q=0.8",
+    "Connection": "keep-alive",
+    "Pragma": "no-cache",
+    "Cache-Control": "no-cache",
     "x-nba-stats-origin": "stats",
-    "x-nba-stats-token":  "true",
-    "Referer":            "https://www.nba.com/",
-    "Connection":         "keep-alive",
-    "Origin":             "https://www.nba.com",
+    "x-nba-stats-token": "true",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
 }
 
-ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
-ESPN_HDR  = {"User-Agent": "Mozilla/5.0"}
-NBA_CDN   = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
-
-ABBREV_TO_NBA_ID = {
-    "ATL":1610612737,"BOS":1610612738,"BKN":1610612751,"CHA":1610612766,
-    "CHI":1610612741,"CLE":1610612739,"DAL":1610612742,"DEN":1610612743,
-    "DET":1610612765,"GSW":1610612744,"HOU":1610612745,"IND":1610612754,
-    "LAC":1610612746,"LAL":1610612747,"MEM":1610612763,"MIA":1610612748,
-    "MIL":1610612749,"MIN":1610612750,"NOP":1610612740,"NYK":1610612752,
-    "OKC":1610612760,"ORL":1610612753,"PHI":1610612755,"PHX":1610612756,
-    "POR":1610612757,"SAC":1610612758,"SAS":1610612759,"TOR":1610612761,
-    "UTA":1610612762,"WAS":1610612764,
-    "GS":1610612744,"NO":1610612740,"NY":1610612752,
-    "SA":1610612759,"WSH":1610612764,
+TEAM_ABBR_MAP = {
+    "ATL": 1610612737, "BOS": 1610612738, "BKN": 1610612751, "CHA": 1610612766,
+    "CHI": 1610612741, "CLE": 1610612739, "DAL": 1610612742, "DEN": 1610612743,
+    "DET": 1610612765, "GSW": 1610612744, "HOU": 1610612745, "IND": 1610612754,
+    "LAC": 1610612746, "LAL": 1610612747, "MEM": 1610612763, "MIA": 1610612748,
+    "MIL": 1610612749, "MIN": 1610612750, "NOP": 1610612740, "NYK": 1610612752,
+    "OKC": 1610612760, "ORL": 1610612753, "PHI": 1610612755, "PHX": 1610612756,
+    "POR": 1610612757, "SAC": 1610612758, "SAS": 1610612759, "TOR": 1610612761,
+    "UTA": 1610612762, "WAS": 1610612764,
 }
+TEAM_ABBR_MAP["UTAH"] = TEAM_ABBR_MAP["UTA"]
+TEAM_ABBR_MAP["GS"] = TEAM_ABBR_MAP["GSW"]
+TEAM_ABBR_MAP["SA"] = TEAM_ABBR_MAP["SAS"]
+TEAM_ABBR_MAP["NO"] = TEAM_ABBR_MAP["NOP"]
+TEAM_ABBR_MAP["NY"] = TEAM_ABBR_MAP["NYK"]
 
 
-def _patch():
-    try:
-        from nba_api.stats.library.http import NBAStatsHTTP
-        NBAStatsHTTP.headers = NBA_HEADERS.copy()
-    except Exception:
-        pass
-
-_patch()
-
-from nba_api.stats.endpoints import (
-    leaguegamefinder,
-    leaguedashteamstats,
-    leaguedashplayerstats,
-)
-
-
-def safe_call(fn, *args, retries=2, **kwargs):
-    for attempt in range(retries):
-        try:
-            time.sleep(SLEEP)
-            return fn(*args, timeout=TIMEOUT, **kwargs)
-        except Exception as e:
-            logger.warning("NBA API call failed (attempt %d): %s", attempt + 1, e)
-            if attempt < retries - 1:
-                time.sleep(3)
-    return None
-
-
-# ─── SCHEDULE ─────────────────────────────────────────────────
-
-def get_today_games() -> list:
+def _season_string() -> str:
     today = date.today()
-    games = _espn_schedule(today)
-    if not games:
-        logger.warning("ESPN schedule empty — trying NBA CDN")
-        games = _nba_cdn_schedule(today)
-    logger.info("Found %d games for %s", len(games), today)
-    return games
+    if today.month >= 10:
+        start_year = today.year
+    else:
+        start_year = today.year - 1
+    end_year = str(start_year + 1)[-2:]
+    return f"{start_year}-{end_year}"
 
 
-def _espn_schedule(target_date: date) -> list:
-    try:
-        r = requests.get(
-            ESPN_BASE + "/scoreboard",
-            params={"dates": target_date.strftime("%Y%m%d")},
-            headers=ESPN_HDR, timeout=10,
-        )
-        r.raise_for_status()
-        events = r.json().get("events", [])
-        games  = []
-        for ev in events:
-            comp  = ev.get("competitions", [{}])[0]
-            comps = comp.get("competitors", [])
-            home  = next((c for c in comps if c.get("homeAway") == "home"), {})
-            away  = next((c for c in comps if c.get("homeAway") == "away"), {})
-            ht, at = home.get("team", {}), away.get("team", {})
-            ha, aa = ht.get("abbreviation", ""), at.get("abbreviation", "")
-            status = comp.get("status", {}).get("type", {}).get("description", "Scheduled")
-            try:
-                dt           = datetime.fromisoformat(ev.get("date","").replace("Z", "+00:00"))
-                display_time = dt.strftime("%-I:%M %p ET")
-            except Exception:
-                display_time = "TBD"
-            games.append({
-                "game_id":          ev.get("id", ""),
-                "status":           status,
-                "game_time":        display_time,
-                "home_team_id":     ABBREV_TO_NBA_ID.get(ha, 0),
-                "home_team":        ht.get("name", ""),
-                "home_team_city":   ht.get("location", ""),
-                "home_team_abbrev": ha,
-                "home_score":       int(home.get("score", 0) or 0),
-                "away_team_id":     ABBREV_TO_NBA_ID.get(aa, 0),
-                "away_team":        at.get("name", ""),
-                "away_team_city":   at.get("location", ""),
-                "away_team_abbrev": aa,
-                "away_score":       int(away.get("score", 0) or 0),
-                "arena":            comp.get("venue", {}).get("fullName", ""),
-                "source":           "espn",
-            })
-        logger.info("ESPN returned %d games for %s", len(games), target_date)
-        return games
-    except Exception as e:
-        logger.error("ESPN schedule failed: %s", e)
+def _proxies():
+    if DISABLE_PROXY:
+        return None
+    http_proxy = os.getenv("NBA_PROXY_URL", "").strip()
+    https_proxy = os.getenv("NBA_PROXY_URL_HTTPS", "").strip() or http_proxy
+    if not http_proxy and not https_proxy:
+        return None
+    return {
+        "http": http_proxy or https_proxy,
+        "https": https_proxy or http_proxy,
+    }
+
+
+def _resultset_to_rows(payload):
+    rs = payload.get("resultSet") or payload.get("resultSets")
+    if not rs:
         return []
 
+    if isinstance(rs, list):
+        first = rs[0] if rs else {}
+        headers = first.get("headers", [])
+        rows = first.get("rowSet", [])
+    else:
+        headers = rs.get("headers", [])
+        rows = rs.get("rowSet", [])
 
-def _nba_cdn_schedule(target_date: date) -> list:
-    try:
-        r = requests.get(NBA_CDN, headers=ESPN_HDR, timeout=12)
-        r.raise_for_status()
-        today_str = target_date.isoformat()
-        games = []
-        for gd in r.json().get("leagueSchedule", {}).get("gameDates", []):
-            if gd.get("gameDate", "")[:10] != today_str:
-                continue
-            for g in gd.get("games", []):
-                home, away = g.get("homeTeam", {}), g.get("awayTeam", {})
-                games.append({
-                    "game_id":          str(g.get("gameId", "")),
-                    "status":           g.get("gameStatusText", "Scheduled"),
-                    "game_time":        "TBD",
-                    "home_team_id":     home.get("teamId"),
-                    "home_team":        home.get("teamName", ""),
-                    "home_team_city":   home.get("teamCity", ""),
-                    "home_team_abbrev": home.get("teamTricode", ""),
-                    "home_score":       home.get("score", 0),
-                    "away_team_id":     away.get("teamId"),
-                    "away_team":        away.get("teamName", ""),
-                    "away_team_city":   away.get("teamCity", ""),
-                    "away_team_abbrev": away.get("teamTricode", ""),
-                    "away_score":       away.get("score", 0),
-                    "arena":            g.get("arenaName", ""),
-                    "source":           "nba_cdn",
-                })
-        logger.info("NBA CDN returned %d games for %s", len(games), target_date)
-        return games
-    except Exception as e:
-        logger.error("NBA CDN failed: %s", e)
-        return []
+    return [dict(zip(headers, row)) for row in rows]
 
 
-# ─── TEAM STATS ───────────────────────────────────────────────
+def _request_json(url, params=None, timeout=None, retries=None, use_stats_headers=True):
+    timeout = timeout or DEFAULT_TIMEOUT
+    retries = retries if retries is not None else DEFAULT_RETRIES
+    headers = COMMON_HEADERS.copy() if use_stats_headers else {
+        "User-Agent": COMMON_HEADERS["User-Agent"],
+        "Accept": "application/json, text/plain, */*",
+    }
 
-def get_all_team_stats_batch(measure_type="Advanced", location=None, last_n=None) -> dict:
-    kwargs = dict(
-        season=CURRENT_SEASON,
-        season_type_all_star=SEASON_TYPE,
-        measure_type_detailed_defense=measure_type,
-        per_mode_detailed="PerGame",
-    )
-    if location:
-        kwargs["location_nullable"] = location
-    if last_n:
-        kwargs["last_n_games"] = last_n
-
-    result = safe_call(leaguedashteamstats.LeagueDashTeamStats, **kwargs)
-    if result:
+    last_err = None
+    for attempt in range(1, retries + 1):
         try:
-            df    = result.get_data_frames()[0]
-            stats = {}
-            for _, row in df.iterrows():
-                tid = int(row.get("TEAM_ID", 0))
-                if measure_type == "Advanced":
-                    stats[tid] = {
-                        "team_name":  row.get("TEAM_NAME", ""),
-                        "off_rating": float(row.get("OFF_RATING", 110) or 110),
-                        "def_rating": float(row.get("DEF_RATING", 110) or 110),
-                        "net_rating": float(row.get("NET_RATING",   0) or 0),
-                        "pace":       float(row.get("PACE",        100) or 100),
-                        "ts_pct":     float(row.get("TS_PCT",     0.55) or 0.55),
-                        "wins":       int(row.get("W", 0)               or 0),
-                        "losses":     int(row.get("L", 0)               or 0),
-                    }
-                else:
-                    stats[tid] = {
-                        "pts":        float(row.get("PTS",        0) or 0),
-                        "fg_pct":     float(row.get("FG_PCT",     0) or 0),
-                        "three_pct":  float(row.get("FG3_PCT",    0) or 0),
-                        "rebounds":   float(row.get("REB",        0) or 0),
-                        "assists":    float(row.get("AST",        0) or 0),
-                        "turnovers":  float(row.get("TOV",        0) or 0),
-                        "wins":       int(row.get("W",            0) or 0),
-                        "losses":     int(row.get("L",            0) or 0),
-                        "net_rating": float(row.get("PLUS_MINUS", 0) or 0),
-                    }
-            if stats:
-                logger.info("Batch stats (%s, loc=%s, L%s): %d teams",
-                            measure_type, location, last_n, len(stats))
-                return stats
+            with REQUEST_LOCK:
+                time.sleep(random.uniform(0.8, 1.3))
+                resp = SESSION.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=timeout,
+                    proxies=_proxies(),
+                )
+            resp.raise_for_status()
+            return resp.json()
         except Exception as e:
-            logger.warning("Team stats parse failed: %s", e)
-
-    # ESPN standings fallback for Advanced stats only
-    if measure_type == "Advanced" and not location and not last_n:
-        logger.info("NBA.com team stats unavailable — ESPN standings fallback")
-        return _espn_team_stats_fallback()
-
-    logger.warning("Team stats returned None (%s loc=%s)", measure_type, location)
-    return {}
+            last_err = e
+            logger.warning("NBA API call failed (attempt %d): %s", attempt, e)
+            if attempt < retries:
+                time.sleep(1.5 + attempt)
+    raise last_err
 
 
-def _espn_team_stats_fallback() -> dict:
-    stats = {}
+def _stats(endpoint: str, params: dict):
+    return _request_json(f"{NBA_STATS_BASE}/{endpoint}", params=params, use_stats_headers=True)
+
+
+def get_today_games():
     try:
-        r = requests.get(
-            ESPN_BASE + "/standings",
-            params={"season": "2026"},
-            headers=ESPN_HDR, timeout=10,
-        )
-        r.raise_for_status()
-        for group in r.json().get("children", []):
-            for entry in group.get("standings", {}).get("entries", []):
-                team   = entry.get("team", {})
-                abbrev = team.get("abbreviation", "")
-                tid    = ABBREV_TO_NBA_ID.get(abbrev, 0)
-                if not tid:
-                    continue
-                wins, losses, ppg, oppg = 0, 0, 110.0, 110.0
-                for stat in entry.get("stats", []):
-                    n, v = stat.get("name", ""), stat.get("value", 0)
-                    if n == "wins":            wins   = int(v)
-                    elif n == "losses":        losses = int(v)
-                    elif n == "pointsFor":     ppg    = float(v)
-                    elif n == "pointsAgainst": oppg   = float(v)
-                stats[tid] = {
-                    "team_name":  team.get("displayName", abbrev),
-                    "off_rating": round(ppg,  1),
-                    "def_rating": round(oppg, 1),
-                    "net_rating": round(ppg - oppg, 1),
-                    "pace":       100.0,
-                    "ts_pct":     0.565,
-                    "wins":       wins,
-                    "losses":     losses,
-                    "source":     "espn_standings",
-                }
-        logger.info("ESPN standings fallback: %d teams", len(stats))
-        return stats
-    except Exception as e:
-        logger.warning("ESPN standings fallback failed: %s", e)
-        return {}
-
-
-def get_all_team_recent_batch(last_n: int) -> dict:
-    return get_all_team_stats_batch("Base", last_n=last_n)
-
-
-def get_all_player_stats_batch() -> dict:
-    result = safe_call(
-        leaguedashplayerstats.LeagueDashPlayerStats,
-        season=CURRENT_SEASON,
-        season_type_all_star=SEASON_TYPE,
-        measure_type_detailed_defense="Advanced",
-        per_mode_detailed="PerGame",
-    )
-    if not result:
-        return {}
-    try:
-        df           = result.get_data_frames()[0]
-        team_players = {}
-        for _, row in df.iterrows():
-            tid = int(row.get("TEAM_ID", 0))
-            if tid not in team_players:
-                team_players[tid] = []
-            team_players[tid].append({
-                "name":       row.get("PLAYER_NAME", ""),
-                "usage_rate": float(row.get("USG_PCT",    0) or 0),
-                "minutes":    float(row.get("MIN",        0) or 0),
-                "pie":        float(row.get("PIE",        0) or 0),
-                "net_rating": float(row.get("NET_RATING", 0) or 0),
+        payload = _request_json(NBA_SCOREBOARD_URL, use_stats_headers=False, retries=1, timeout=10)
+        games = payload.get("scoreboard", {}).get("games", [])
+        out = []
+        for g in games:
+            home = g.get("homeTeam", {})
+            away = g.get("awayTeam", {})
+            out.append({
+                "game_id": g.get("gameId"),
+                "home_team_id": int(home.get("teamId", 0) or 0),
+                "away_team_id": int(away.get("teamId", 0) or 0),
+                "home_team_abbrev": home.get("teamTricode"),
+                "away_team_abbrev": away.get("teamTricode"),
+                "home_team_city": home.get("teamCity"),
+                "away_team_city": away.get("teamCity"),
+                "home_team": home.get("teamName"),
+                "away_team": away.get("teamName"),
+                "game_status": g.get("gameStatusText"),
+                "game_et": g.get("gameEt"),
             })
-        for tid in team_players:
-            team_players[tid].sort(key=lambda p: p["usage_rate"], reverse=True)
-        logger.info("Player adv stats: %d teams", len(team_players))
-        return team_players
+        return out
     except Exception as e:
-        logger.warning("Player adv stats failed: %s", e)
+        logger.warning("Today games fetch failed: %s", e)
+        return []
+
+
+def get_all_team_stats_batch(measure_type="Base", location=None):
+    params = {
+        "Conference": "",
+        "DateFrom": "",
+        "DateTo": "",
+        "Division": "",
+        "GameScope": "",
+        "GameSegment": "",
+        "LastNGames": 0,
+        "LeagueID": "00",
+        "Location": location or "",
+        "MeasureType": measure_type,
+        "Month": 0,
+        "OpponentTeamID": 0,
+        "Outcome": "",
+        "PORound": 0,
+        "PaceAdjust": "N",
+        "PerMode": "PerGame",
+        "Period": 0,
+        "PlayerExperience": "",
+        "PlayerPosition": "",
+        "PlusMinus": "N",
+        "Rank": "N",
+        "Season": _season_string(),
+        "SeasonSegment": "",
+        "SeasonType": "Regular Season",
+        "ShotClockRange": "",
+        "StarterBench": "",
+        "TeamID": 0,
+        "TwoWay": "",
+        "VsConference": "",
+        "VsDivision": "",
+    }
+    try:
+        rows = _resultset_to_rows(_stats("leaguedashteamstats", params))
+        out = {}
+        for r in rows:
+            tid = int(r.get("TEAM_ID", 0) or 0)
+            if tid:
+                out[tid] = {k.lower(): v for k, v in r.items()}
+        return out
+    except Exception as e:
+        logger.warning("Team stats returned None (%s loc=%s)", measure_type, location)
+        logger.warning("Team stats error detail: %s", e)
         return {}
 
 
-def get_h2h_history(team_id: int, opponent_id: int) -> list:
-    all_games = []
-    for year in [2025, 2024]:
-        season_str = f"{year}-{str(year+1)[-2:]}"
-        result = safe_call(
-            leaguegamefinder.LeagueGameFinder,
-            team_id_nullable=team_id,
-            vs_team_id_nullable=opponent_id,
-            season_nullable=season_str,
-            season_type_nullable=SEASON_TYPE,
-        )
-        if not result:
-            continue
-        try:
-            df = result.get_data_frames()[0]
-            for _, row in df.iterrows():
-                pts = int(row.get("PTS", 0) or 0)
-                pm  = float(row.get("PLUS_MINUS", 0) or 0)
-                all_games.append({
-                    "home_win":  pm > 0 and "vs." in str(row.get("MATCHUP", "")),
-                    "total_pts": pts * 2 - pm,
-                    "margin":    abs(pm),
-                })
-        except Exception:
-            continue
-    return all_games
+def get_all_team_recent_batch(last_n_games=10):
+    params = {
+        "Conference": "",
+        "DateFrom": "",
+        "DateTo": "",
+        "Division": "",
+        "GameScope": "",
+        "GameSegment": "",
+        "LastNGames": last_n_games,
+        "LeagueID": "00",
+        "Location": "",
+        "MeasureType": "Base",
+        "Month": 0,
+        "OpponentTeamID": 0,
+        "Outcome": "",
+        "PORound": 0,
+        "PaceAdjust": "N",
+        "PerMode": "PerGame",
+        "Period": 0,
+        "PlayerExperience": "",
+        "PlayerPosition": "",
+        "PlusMinus": "N",
+        "Rank": "N",
+        "Season": _season_string(),
+        "SeasonSegment": "",
+        "SeasonType": "Regular Season",
+        "ShotClockRange": "",
+        "StarterBench": "",
+        "TeamID": 0,
+        "TwoWay": "",
+        "VsConference": "",
+        "VsDivision": "",
+    }
+    try:
+        rows = _resultset_to_rows(_stats("leaguedashteamstats", params))
+        out = {}
+        for r in rows:
+            tid = int(r.get("TEAM_ID", 0) or 0)
+            if tid:
+                out[tid] = {k.lower(): v for k, v in r.items()}
+        return out
+    except Exception as e:
+        logger.warning("Recent team stats failed for last_n=%s: %s", last_n_games, e)
+        return {}
+
+
+def get_all_player_stats_batch():
+    params = {
+        "College": "",
+        "Conference": "",
+        "Country": "",
+        "DateFrom": "",
+        "DateTo": "",
+        "Division": "",
+        "DraftPick": "",
+        "DraftYear": "",
+        "GameScope": "",
+        "GameSegment": "",
+        "Height": "",
+        "LastNGames": 0,
+        "LeagueID": "00",
+        "Location": "",
+        "MeasureType": "Advanced",
+        "Month": 0,
+        "OpponentTeamID": 0,
+        "Outcome": "",
+        "PORound": 0,
+        "PaceAdjust": "N",
+        "PerMode": "PerGame",
+        "Period": 0,
+        "PlayerExperience": "",
+        "PlayerPosition": "",
+        "PlusMinus": "N",
+        "Rank": "N",
+        "Season": _season_string(),
+        "SeasonSegment": "",
+        "SeasonType": "Regular Season",
+        "ShotClockRange": "",
+        "StarterBench": "",
+        "TeamID": 0,
+        "VsConference": "",
+        "VsDivision": "",
+        "Weight": "",
+    }
+    try:
+        rows = _resultset_to_rows(_stats("leaguedashplayerstats", params))
+        grouped = {}
+        for r in rows:
+            tid = int(r.get("TEAM_ID", 0) or 0)
+            if not tid:
+                continue
+            grouped.setdefault(tid, []).append({
+                "player_id": r.get("PLAYER_ID"),
+                "name": r.get("PLAYER_NAME"),
+                "team_id": tid,
+                "team_abbrev": r.get("TEAM_ABBREVIATION"),
+                "minutes": float(r.get("MIN", 0) or 0),
+                "usage_rate": float(r.get("USG_PCT", 0) or 0),
+                "off_rating": float(r.get("OFF_RATING", 0) or 0),
+                "def_rating": float(r.get("DEF_RATING", 0) or 0),
+                "net_rating": float(r.get("NET_RATING", 0) or 0),
+                "ast_pct": float(r.get("AST_PCT", 0) or 0),
+                "reb_pct": float(r.get("REB_PCT", 0) or 0),
+            })
+        return grouped
+    except Exception as e:
+        logger.warning("All player advanced stats failed: %s", e)
+        return {}
