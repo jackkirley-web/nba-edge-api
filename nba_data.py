@@ -1,6 +1,4 @@
-# nba_data.py — Uses upcoming schedule (not live scoreboard)
-# The live scoreboard shows completed games. We need upcoming games
-# to match what The Odds API shows.
+# nba_data.py — Browser headers + fast timeouts + correct season
 
 import logging
 import time
@@ -16,32 +14,51 @@ from nba_api.stats.endpoints import (
 )
 
 CURRENT_SEASON = "2025-26"
-SEASON_TYPE = "Regular Season"
-SLEEP = 0.6
+SEASON_TYPE    = "Regular Season"
+SLEEP          = 0.6
+TIMEOUT        = 15    # Was 30 — fail faster
+
+# Browser headers — NBA.com blocks requests without these
+NBA_HEADERS = {
+    "Host":               "stats.nba.com",
+    "User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Accept":             "application/json, text/plain, */*",
+    "Accept-Language":    "en-US,en;q=0.9",
+    "Accept-Encoding":    "gzip, deflate, br",
+    "x-nba-stats-origin": "stats",
+    "x-nba-stats-token":  "true",
+    "Referer":            "https://www.nba.com/",
+    "Connection":         "keep-alive",
+    "Origin":             "https://www.nba.com",
+}
 
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 NBA_CDN   = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
 
 
-def safe_call(fn, *args, retries=3, **kwargs):
+def safe_call(fn, *args, retries=2, **kwargs):
+    """Call nba_api with browser headers. 2 retries max, fail fast."""
     for attempt in range(retries):
         try:
             time.sleep(SLEEP)
-            return fn(*args, **kwargs)
+            return fn(*args, timeout=TIMEOUT, headers=NBA_HEADERS, **kwargs)
+        except TypeError:
+            # nba_api version doesn't accept headers — try without
+            try:
+                time.sleep(SLEEP)
+                return fn(*args, timeout=TIMEOUT, **kwargs)
+            except Exception as e:
+                logger.warning("NBA API call failed (attempt %d): %s", attempt + 1, e)
         except Exception as e:
-            logger.warning("NBA API call failed (attempt %d): %s", attempt+1, e)
+            logger.warning("NBA API call failed (attempt %d): %s", attempt + 1, e)
             if attempt < retries - 1:
-                time.sleep(2 ** attempt)
+                time.sleep(2)
     return None
 
 
+# ─── SCHEDULE ─────────────────────────────────────────────────
+
 def get_today_games():
-    """
-    Get TODAY'S upcoming NBA games.
-    Uses ESPN scoreboard which correctly shows today's scheduled games
-    including ones that haven't tipped off yet.
-    Falls back to NBA CDN schedule.
-    """
     today = date.today()
     games = _fetch_espn_schedule(today)
     if not games:
@@ -52,10 +69,6 @@ def get_today_games():
 
 
 def _fetch_espn_schedule(target_date: date) -> list:
-    """
-    ESPN scoreboard — shows today's games including pre-game.
-    Returns games in same format as before.
-    """
     try:
         date_str = target_date.strftime("%Y%m%d")
         r = requests.get(
@@ -65,48 +78,35 @@ def _fetch_espn_schedule(target_date: date) -> list:
             headers={"User-Agent": "Mozilla/5.0"}
         )
         r.raise_for_status()
-        data = r.json()
+        data   = r.json()
         events = data.get("events", [])
-        games = []
+        games  = []
         for ev in events:
-            comp = ev.get("competitions", [{}])[0]
+            comp        = ev.get("competitions", [{}])[0]
             competitors = comp.get("competitors", [])
             home = next((c for c in competitors if c.get("homeAway") == "home"), {})
             away = next((c for c in competitors if c.get("homeAway") == "away"), {})
-
             home_team = home.get("team", {})
             away_team = away.get("team", {})
-
-            # Get NBA team IDs from ESPN (they differ from NBA.com IDs)
-            # We'll use abbreviation-based matching instead of IDs
             home_abbrev = home_team.get("abbreviation", "")
             away_abbrev = away_team.get("abbreviation", "")
-
-            # Map ESPN team IDs to NBA.com team IDs
-            home_nba_id = _espn_to_nba_id(home_abbrev)
-            away_nba_id = _espn_to_nba_id(away_abbrev)
-
-            status = comp.get("status", {}).get("type", {}).get("description", "Scheduled")
+            status   = comp.get("status", {}).get("type", {}).get("description", "Scheduled")
             game_time = ev.get("date", "")
-
-            # Format game time for display
             try:
                 dt = datetime.fromisoformat(game_time.replace("Z", "+00:00"))
-                # Convert to local-ish display (show ET)
                 display_time = dt.strftime("%-I:%M %p ET")
             except Exception:
                 display_time = "TBD"
-
             games.append({
                 "game_id":          ev.get("id", ""),
                 "status":           status,
                 "game_time":        display_time,
-                "home_team_id":     home_nba_id,
+                "home_team_id":     _espn_to_nba_id(home_abbrev),
                 "home_team":        home_team.get("name", ""),
                 "home_team_city":   home_team.get("location", ""),
                 "home_team_abbrev": home_abbrev,
                 "home_score":       int(home.get("score", 0) or 0),
-                "away_team_id":     away_nba_id,
+                "away_team_id":     _espn_to_nba_id(away_abbrev),
                 "away_team":        away_team.get("name", ""),
                 "away_team_city":   away_team.get("location", ""),
                 "away_team_abbrev": away_abbrev,
@@ -122,19 +122,13 @@ def _fetch_espn_schedule(target_date: date) -> list:
 
 
 def _fetch_nba_cdn_schedule(target_date: date) -> list:
-    """
-    NBA CDN static schedule — fallback.
-    Slower but comprehensive.
-    """
     try:
         r = requests.get(NBA_CDN, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
-        data = r.json()
+        data      = r.json()
         today_str = target_date.isoformat()
-        games = []
-
-        game_dates = data.get("leagueSchedule", {}).get("gameDates", [])
-        for gd in game_dates:
+        games     = []
+        for gd in data.get("leagueSchedule", {}).get("gameDates", []):
             if gd.get("gameDate", "")[:10] != today_str:
                 continue
             for g in gd.get("games", []):
@@ -143,7 +137,7 @@ def _fetch_nba_cdn_schedule(target_date: date) -> list:
                 games.append({
                     "game_id":          str(g.get("gameId", "")),
                     "status":           g.get("gameStatusText", "Scheduled"),
-                    "game_time":        g.get("gameDateTimeEst", "")[-8:-3] + " ET",
+                    "game_time":        "TBD",
                     "home_team_id":     home.get("teamId"),
                     "home_team":        home.get("teamName", ""),
                     "home_team_city":   home.get("teamCity", ""),
@@ -164,8 +158,6 @@ def _fetch_nba_cdn_schedule(target_date: date) -> list:
         return []
 
 
-# ── ESPN team abbreviation → NBA.com team ID ──────────────────
-# NBA.com IDs are stable. ESPN abbreviations match NBA tricodes.
 ABBREV_TO_NBA_ID = {
     "ATL": 1610612737, "BOS": 1610612738, "BKN": 1610612751,
     "CHA": 1610612766, "CHI": 1610612741, "CLE": 1610612739,
@@ -183,8 +175,10 @@ def _espn_to_nba_id(abbrev: str) -> int:
     return ABBREV_TO_NBA_ID.get(abbrev, 0)
 
 
+# ─── TEAM STATS ───────────────────────────────────────────────
+
 def get_all_team_stats_batch(measure_type="Advanced", location=None, last_n=None):
-    """Fetch stats for ALL 30 teams in ONE API call."""
+    """Fetch stats for all 30 teams in one API call."""
     kwargs = dict(
         season=CURRENT_SEASON,
         season_type_all_star=SEASON_TYPE,
@@ -198,9 +192,10 @@ def get_all_team_stats_batch(measure_type="Advanced", location=None, last_n=None
 
     result = safe_call(leaguedashteamstats.LeagueDashTeamStats, **kwargs)
     if not result:
+        logger.warning("Team stats batch returned None (%s loc=%s)", measure_type, location)
         return {}
     try:
-        df = result.get_data_frames()[0]
+        df    = result.get_data_frames()[0]
         stats = {}
         for _, row in df.iterrows():
             team_id = int(row.get("TEAM_ID", 0))
@@ -227,10 +222,8 @@ def get_all_team_stats_batch(measure_type="Advanced", location=None, last_n=None
                     "losses":     int(row.get("L", 0)            or 0),
                     "net_rating": float(row.get("PLUS_MINUS", 0) or 0),
                 }
-        logger.info(
-            "Batch stats (%s, loc=%s, L%s): %d teams",
-            measure_type, location, last_n, len(stats)
-        )
+        logger.info("Batch stats (%s, loc=%s, L%s): %d teams",
+                    measure_type, location, last_n, len(stats))
         return stats
     except Exception as e:
         logger.warning("get_all_team_stats_batch failed: %s", e)
@@ -242,7 +235,7 @@ def get_all_team_recent_batch(last_n: int):
 
 
 def get_all_player_stats_batch():
-    """Get player advanced stats for ALL players in one call."""
+    """Player advanced stats for all players in one call."""
     result = safe_call(
         leaguedashplayerstats.LeagueDashPlayerStats,
         season=CURRENT_SEASON,
@@ -253,7 +246,7 @@ def get_all_player_stats_batch():
     if not result:
         return {}
     try:
-        df = result.get_data_frames()[0]
+        df           = result.get_data_frames()[0]
         team_players = {}
         for _, row in df.iterrows():
             team_id = int(row.get("TEAM_ID", 0))
@@ -277,8 +270,8 @@ def get_all_player_stats_batch():
 
 def get_h2h_history(team_id: int, opponent_id: int):
     all_games = []
-    for year in [2024, 2023]:
-        season_str = str(year) + "-" + str(year+1)[-2:]
+    for year in [2025, 2024]:
+        season_str = str(year) + "-" + str(year + 1)[-2:]
         result = safe_call(
             leaguegamefinder.LeagueGameFinder,
             team_id_nullable=team_id,
