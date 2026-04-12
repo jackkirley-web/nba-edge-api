@@ -57,12 +57,6 @@ def get_streaks(
     perfect_only: bool = Query(False),
     limit: int = Query(100),
 ):
-    """
-    Returns real streak data from NBA.com game logs.
-    Calculated in a background thread — won't block picks/props loading.
-    Returns {streaks, loading, last_updated}
-    If loading=true, the frontend should show a loading state and poll again.
-    """
     result = streak_cache.get()
     streaks = result.get("streaks", [])
     loading = result.get("loading", False)
@@ -82,23 +76,24 @@ def get_streaks(
             continue
 
         filtered.append({
-            "player":      s["player"],
-            "team":        s["team"],
-            "position":    s.get("position", ""),
-            "stat":        s["stat"],
-            "stat_label":  s["stat_label"],
-            "threshold":   s["threshold"],
-            "label":       s["label"],
-            "season_avg":  s["season_avg"],
-            "recent_avg":  s.get("recent_avg", s["season_avg"]),
-            "trend":       s.get("trend", "stable"),
-            "hits":        wd["hits"],
-            "games":       window,
-            "hit_rate":    wd["hit_rate"],
-            "pct":         wd["pct"],
-            "is_perfect":  wd["hits"] == window,
-            "last_5_vals": s.get("last_5_vals", []),
-            "all_windows": s.get("windows", {}),
+            "player":       s["player"],
+            "team":         s["team"],
+            "position":     s.get("position", ""),
+            "stat":         s["stat"],
+            "stat_label":   s["stat_label"],
+            "threshold":    s["threshold"],
+            "label":        s["label"],
+            "season_avg":   s["season_avg"],
+            "recent_avg":   s.get("recent_avg", s["season_avg"]),
+            "trend":        s.get("trend", "stable"),
+            "hits":         wd["hits"],
+            "games":        window,
+            "hit_rate":     wd["hit_rate"],
+            "pct":          wd["pct"],
+            "is_perfect":   wd["hits"] == window,
+            "last_5_vals":  s.get("last_5_vals", []),
+            "last_5_dates": s.get("last_5_dates", []),
+            "all_windows":  s.get("windows", {}),
         })
 
     filtered.sort(key=lambda x: (-int(x["is_perfect"]), -x["hit_rate"], -x["threshold"]))
@@ -112,16 +107,87 @@ def get_streaks(
     }
 
 
+@router.get("/api/player-logs-debug")
+def player_logs_debug(name: str = Query(..., description="Partial player name e.g. 'Wagner'")):
+    """
+    Debug endpoint: fetch raw game logs for a specific player by name.
+    Shows exactly what dates and stat values the streak engine sees.
+    Usage: /api/player-logs-debug?name=Wagner
+    """
+    import time
+    from player_logs import get_all_player_base_stats, get_player_game_logs_batch
+
+    # Find matching players in base stats
+    player_base = get_all_player_base_stats()
+    matches = [
+        (pid, p) for pid, p in player_base.items()
+        if name.lower() in p.get("name", "").lower()
+    ]
+
+    if not matches:
+        return {"error": f"No player found matching '{name}'", "available": []}
+
+    results = []
+    for pid, pdata in matches[:3]:  # Limit to 3 matches
+        logs = get_player_game_logs_batch([pid], last_n=15)
+        player_logs = logs.get(pid, [])
+
+        results.append({
+            "player_id":   pid,
+            "name":        pdata["name"],
+            "team":        pdata["team_abbrev"],
+            "season_avgs": {
+                "pts": pdata["pts"],
+                "reb": pdata["reb"],
+                "ast": pdata["ast"],
+                "3pm": pdata["3pm"],
+                "stl": pdata["stl"],
+                "blk": pdata["blk"],
+                "mins": pdata["mins"],
+            },
+            "logs_fetched": len(player_logs),
+            "games": [
+                {
+                    "date":  g.get("game_date", "")[:10],
+                    "matchup": g.get("matchup", ""),
+                    "pts":   g.get("pts"),
+                    "reb":   g.get("reb"),
+                    "ast":   g.get("ast"),
+                    "3pm":   g.get("3pm"),
+                    "stl":   g.get("stl"),
+                    "blk":   g.get("blk"),
+                    "mins":  g.get("mins"),
+                }
+                for g in player_logs
+            ],
+        })
+
+    return {"query": name, "matches": results}
+
+
+@router.get("/api/streak-force-refresh")
+def streak_force_refresh():
+    """Force the streak cache to recalculate immediately."""
+    result = streak_cache.get(force_refresh=True)
+    return {
+        "status": "refresh triggered",
+        "loading": result.get("loading", False),
+        "streaks_cached": len(result.get("streaks", [])),
+        "last_updated": result.get("last_updated"),
+    }
+
+
 @router.get("/api/debug")
 def debug():
     data = cache.get()
     streak_data = streak_cache.get()
     return {
-        "games_found":    len(data.get("games", [])),
-        "legs_scored":    data.get("legs_scored", 0),
-        "props_scored":   data.get("props_scored", 0),
-        "streaks_found":  len(streak_data.get("streaks", [])),
+        "games_found":     len(data.get("games", [])),
+        "legs_scored":     data.get("legs_scored", 0),
+        "props_scored":    data.get("props_scored", 0),
+        "streaks_found":   len(streak_data.get("streaks", [])),
         "streaks_loading": streak_data.get("loading", False),
+        "streaks_updated": streak_data.get("last_updated"),
         "game_list": [
             {"away": g.get("away_team_abbrev"), "home": g.get("home_team_abbrev"),
              "spread": g.get("spread_line"), "total": g.get("total_line")}
