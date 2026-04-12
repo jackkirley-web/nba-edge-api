@@ -1,305 +1,138 @@
-# player_logs.py — NBA.com primary (working during US business hours)
-# Correct season: 2025-26
-# Browser headers applied via NBAStatsHTTP patch
+# player_logs.py
+# Player base stats + player game logs with the same request discipline as nba_data.py.
 
 import logging
-import time
-import requests
-from datetime import datetime
+from collections import defaultdict
+
+from nba_data import _resultset_to_rows, _season_string, _stats
 
 logger = logging.getLogger(__name__)
 
-CURRENT_SEASON = "2025-26"
-SEASON_TYPE    = "Regular Season"
-SLEEP          = 0.6
-TIMEOUT        = 15
 
-NBA_HEADERS = {
-    "Host":               "stats.nba.com",
-    "User-Agent":         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Accept":             "application/json, text/plain, */*",
-    "Accept-Language":    "en-US,en;q=0.9",
-    "Accept-Encoding":    "gzip, deflate, br",
-    "x-nba-stats-origin": "stats",
-    "x-nba-stats-token":  "true",
-    "Referer":            "https://www.nba.com/",
-    "Connection":         "keep-alive",
-    "Origin":             "https://www.nba.com",
-}
+def get_all_player_base_stats():
+    params = {
+        "College": "",
+        "Conference": "",
+        "Country": "",
+        "DateFrom": "",
+        "DateTo": "",
+        "Division": "",
+        "DraftPick": "",
+        "DraftYear": "",
+        "GameScope": "",
+        "GameSegment": "",
+        "Height": "",
+        "LastNGames": 0,
+        "LeagueID": "00",
+        "Location": "",
+        "MeasureType": "Base",
+        "Month": 0,
+        "OpponentTeamID": 0,
+        "Outcome": "",
+        "PORound": 0,
+        "PaceAdjust": "N",
+        "PerMode": "PerGame",
+        "Period": 0,
+        "PlayerExperience": "",
+        "PlayerPosition": "",
+        "PlusMinus": "N",
+        "Rank": "N",
+        "Season": _season_string(),
+        "SeasonSegment": "",
+        "SeasonType": "Regular Season",
+        "ShotClockRange": "",
+        "StarterBench": "",
+        "TeamID": 0,
+        "VsConference": "",
+        "VsDivision": "",
+        "Weight": "",
+    }
 
-
-def _patch():
     try:
-        from nba_api.stats.library.http import NBAStatsHTTP
-        NBAStatsHTTP.headers = NBA_HEADERS.copy()
-    except Exception:
-        pass
-
-_patch()
-
-from nba_api.stats.endpoints import playergamelogs, leaguedashplayerstats
-
-
-def _safe_call(fn, *args, retries=2, **kwargs):
-    for attempt in range(retries):
-        try:
-            time.sleep(SLEEP)
-            return fn(*args, timeout=TIMEOUT, **kwargs)
-        except Exception as e:
-            logger.warning("NBA.com call failed (attempt %d): %s", attempt + 1, e)
-            if attempt < retries - 1:
-                time.sleep(2)
-    return None
-
-
-def get_all_player_base_stats() -> dict:
-    """Season averages via nba_api, falls back to direct HTTP."""
-    # Try nba_api (patched headers)
-    result = _safe_call(
-        leaguedashplayerstats.LeagueDashPlayerStats,
-        season=CURRENT_SEASON,
-        season_type_all_star=SEASON_TYPE,
-        measure_type_detailed_defense="Base",
-        per_mode_detailed="PerGame",
-    )
-    if result:
-        try:
-            df = result.get_data_frames()[0]
-            if not df.empty:
-                players = _parse_player_df(df)
-                if players:
-                    logger.info("Base player stats: %d players (nba_api)", len(players))
-                    return players
-        except Exception as e:
-            logger.warning("nba_api parse failed: %s", e)
-
-    # Direct HTTP fallback
-    logger.info("nba_api failed — trying direct HTTP")
-    return _direct_player_stats()
-
-
-def _direct_player_stats() -> dict:
-    try:
-        time.sleep(SLEEP)
-        r = requests.get(
-            "https://stats.nba.com/stats/leaguedashplayerstats",
-            params={
-                "Season": CURRENT_SEASON, "SeasonType": SEASON_TYPE,
-                "MeasureType": "Base", "PerMode": "PerGame",
-                "LeagueID": "00", "LastNGames": 0, "Month": 0,
-                "OpponentTeamID": 0, "PaceAdjust": "N", "Period": 0,
-                "PlusMinus": "N", "Rank": "N", "TeamID": 0,
-            },
-            headers=NBA_HEADERS, timeout=TIMEOUT,
-        )
-        if r.status_code != 200 or not r.text.strip():
-            return {}
-        rs   = r.json().get("resultSets", [])
-        if not rs:
-            return {}
-        hdrs = rs[0].get("headers", [])
-        rows = rs[0].get("rowSet", [])
-        col  = {h: i for i, h in enumerate(hdrs)}
-
-        def g(row, f, d=0):
-            idx = col.get(f)
-            return row[idx] if idx is not None and row[idx] is not None else d
-
-        players = {}
-        for row in rows:
-            pid = int(g(row, "PLAYER_ID", 0))
-            if not pid:
+        rows = _resultset_to_rows(_stats("leaguedashplayerstats", params))
+        out = {}
+        for r in rows:
+            pid = int(r.get("PLAYER_ID", 0) or 0)
+            tid = int(r.get("TEAM_ID", 0) or 0)
+            if not pid or not tid:
                 continue
-            players[pid] = {
-                "player_id":   pid,
-                "name":        g(row, "PLAYER_NAME", ""),
-                "team_id":     int(g(row, "TEAM_ID", 0)),
-                "team_abbrev": g(row, "TEAM_ABBREVIATION", ""),
-                "position":    g(row, "START_POSITION", "G") or "G",
-                "mins":        round(float(g(row, "MIN",  0)), 1),
-                "pts":         float(g(row, "PTS",  0)),
-                "reb":         float(g(row, "REB",  0)),
-                "ast":         float(g(row, "AST",  0)),
-                "3pm":         float(g(row, "FG3M", 0)),
-                "stl":         float(g(row, "STL",  0)),
-                "blk":         float(g(row, "BLK",  0)),
-                "tov":         float(g(row, "TOV",  0)),
-                "gp":          int(g(row, "GP", 0)),
-                "source":      "nba.com-direct",
+
+            out[pid] = {
+                "player_id": pid,
+                "team_id": tid,
+                "name": r.get("PLAYER_NAME"),
+                "team_abbrev": r.get("TEAM_ABBREVIATION"),
+                "mins": float(r.get("MIN", 0) or 0),
+                "pts": float(r.get("PTS", 0) or 0),
+                "reb": float(r.get("REB", 0) or 0),
+                "ast": float(r.get("AST", 0) or 0),
+                "3pm": float(r.get("FG3M", 0) or 0),
+                "stl": float(r.get("STL", 0) or 0),
+                "blk": float(r.get("BLK", 0) or 0),
+                "tov": float(r.get("TOV", 0) or 0),
+                "fga": float(r.get("FGA", 0) or 0),
+                "fgm": float(r.get("FGM", 0) or 0),
+                "fta": float(r.get("FTA", 0) or 0),
+                "ftm": float(r.get("FTM", 0) or 0),
+                "position": "G",
             }
-        logger.info("Base player stats: %d players (direct HTTP)", len(players))
-        return players
+        return out
     except Exception as e:
         logger.warning("Direct player stats failed: %s", e)
         return {}
 
 
-def _parse_player_df(df) -> dict:
-    players = {}
-    for _, row in df.iterrows():
-        pid = int(row.get("PLAYER_ID", 0))
-        if not pid:
-            continue
-        players[pid] = {
-            "player_id":   pid,
-            "name":        row.get("PLAYER_NAME", ""),
-            "team_id":     int(row.get("TEAM_ID", 0)),
-            "team_abbrev": row.get("TEAM_ABBREVIATION", ""),
-            "position":    row.get("START_POSITION", "G") or "G",
-            "mins":        round(float(row.get("MIN",  0) or 0), 1),
-            "pts":         float(row.get("PTS",  0) or 0),
-            "reb":         float(row.get("REB",  0) or 0),
-            "ast":         float(row.get("AST",  0) or 0),
-            "3pm":         float(row.get("FG3M", 0) or 0),
-            "stl":         float(row.get("STL",  0) or 0),
-            "blk":         float(row.get("BLK",  0) or 0),
-            "tov":         float(row.get("TOV",  0) or 0),
-            "gp":          int(row.get("GP", 0) or 0),
-            "source":      "nba_api",
+def get_player_game_logs_batch(player_ids, last_n=15):
+    logs = defaultdict(list)
+
+    for pid in player_ids:
+        params = {
+            "DateFrom": "",
+            "DateTo": "",
+            "GameSegment": "",
+            "LastNGames": last_n,
+            "LeagueID": "00",
+            "Location": "",
+            "MeasureType": "Base",
+            "Month": 0,
+            "OpposingTeamID": 0,
+            "Outcome": "",
+            "PORound": 0,
+            "PerMode": "PerGame",
+            "Period": 0,
+            "PlayerID": pid,
+            "Season": _season_string(),
+            "SeasonSegment": "",
+            "SeasonType": "Regular Season",
+            "ShotClockRange": "",
+            "TeamID": 0,
+            "VsConference": "",
+            "VsDivision": "",
         }
-    return players
 
-
-def get_player_game_logs_batch(player_ids: list, last_n: int = 15) -> dict:
-    results          = {}
-    total            = len(player_ids)
-    consecutive_fail = 0
-
-    for i, player_id in enumerate(player_ids):
-        if i % 20 == 0:
-            logger.info("Fetching logs: %d/%d", i, total)
-
-        # Skip negative IDs (legacy BDL/ESPN ids from old code)
-        if isinstance(player_id, int) and player_id < 0:
-            continue
-        if isinstance(player_id, str):
-            continue
-
-        logs = _fetch_nbacom_logs(player_id, last_n)
-
-        if logs:
-            results[player_id] = logs
-            consecutive_fail   = max(0, consecutive_fail - 1)
-        else:
-            consecutive_fail += 1
-            # Try direct HTTP as fallback
-            logs = _fetch_direct_logs(player_id, last_n)
-            if logs:
-                results[player_id] = logs
-                consecutive_fail   = max(0, consecutive_fail - 1)
-            elif consecutive_fail >= 10:
-                logger.warning("10 consecutive failures — NBA.com may be down")
-                # Back off but keep trying
-                time.sleep(5)
-                consecutive_fail = 0
-
-    logger.info("Got logs for %d/%d players", len(results), total)
-    return results
-
-
-def _fetch_nbacom_logs(player_id: int, last_n: int) -> list:
-    try:
-        time.sleep(SLEEP)
-        ep = playergamelogs.PlayerGameLogs(
-            player_id_nullable=player_id,
-            season_nullable=CURRENT_SEASON,
-            season_type_nullable=SEASON_TYPE,
-            last_n_games_nullable=last_n,
-            timeout=TIMEOUT,
-        )
-        df = ep.get_data_frames()[0]
-        if df.empty:
-            return []
-        return _parse_logs_df(df)
-    except Exception as e:
-        err = str(e)
-        if "Expecting value" not in err and "line 1 column 1" not in err:
-            logger.warning("nba_api logs failed %d: %s", player_id, e)
-        return []
-
-
-def _fetch_direct_logs(player_id: int, last_n: int) -> list:
-    try:
-        time.sleep(SLEEP)
-        r = requests.get(
-            "https://stats.nba.com/stats/playergamelogs",
-            params={
-                "PlayerIDNullable":   player_id,
-                "Season":             CURRENT_SEASON,
-                "SeasonTypeNullable": SEASON_TYPE,
-                "LastNGamesNullable": last_n,
-            },
-            headers=NBA_HEADERS, timeout=TIMEOUT,
-        )
-        if r.status_code != 200 or not r.text.strip():
-            return []
-        rs = r.json().get("resultSets", [])
-        if not rs or not rs[0].get("rowSet"):
-            return []
-        hdrs = rs[0]["headers"]
-        rows = rs[0]["rowSet"]
-        col  = {h: i for i, h in enumerate(hdrs)}
-
-        def g(row, f, d=0):
-            idx = col.get(f)
-            return row[idx] if idx is not None and row[idx] is not None else d
-
-        logs = []
-        for row in rows:
-            raw = str(g(row, "GAME_DATE", ""))
-            try:
-                pd = datetime.strptime(raw[:10], "%Y-%m-%d")
-            except Exception:
-                pd = datetime.min
-            logs.append({
-                "game_date":   raw,
-                "parsed_date": pd,
-                "matchup":     g(row, "MATCHUP", ""),
-                "is_home":     "vs." in str(g(row, "MATCHUP", "")),
-                "mins":        float(g(row, "MIN", 0)),
-                "pts":         int(g(row, "PTS", 0)),
-                "reb":         int(g(row, "REB", 0)),
-                "ast":         int(g(row, "AST", 0)),
-                "3pm":         int(g(row, "FG3M", 0)),
-                "stl":         int(g(row, "STL", 0)),
-                "blk":         int(g(row, "BLK", 0)),
-                "tov":         int(g(row, "TOV", 0)),
-                "plus_minus":  float(g(row, "PLUS_MINUS", 0)),
-                "source":      "nba.com-direct",
-            })
-        logs.sort(key=lambda x: x["parsed_date"], reverse=True)
-        for log in logs:
-            del log["parsed_date"]
-        return logs
-    except Exception as e:
-        logger.warning("Direct logs failed %d: %s", player_id, e)
-        return []
-
-
-def _parse_logs_df(df) -> list:
-    logs = []
-    for _, row in df.iterrows():
-        raw = str(row.get("GAME_DATE", "") or "")
         try:
-            pd = datetime.strptime(raw[:10], "%Y-%m-%d")
-        except Exception:
-            pd = datetime.min
-        logs.append({
-            "game_date":   raw,
-            "parsed_date": pd,
-            "matchup":     row.get("MATCHUP", ""),
-            "is_home":     "vs." in str(row.get("MATCHUP", "")),
-            "mins":        float(row.get("MIN",  0) or 0),
-            "pts":         int(row.get("PTS",  0) or 0),
-            "reb":         int(row.get("REB",  0) or 0),
-            "ast":         int(row.get("AST",  0) or 0),
-            "3pm":         int(row.get("FG3M", 0) or 0),
-            "stl":         int(row.get("STL",  0) or 0),
-            "blk":         int(row.get("BLK",  0) or 0),
-            "tov":         int(row.get("TOV",  0) or 0),
-            "plus_minus":  float(row.get("PLUS_MINUS", 0) or 0),
-        })
-    logs.sort(key=lambda x: x["parsed_date"], reverse=True)
-    for log in logs:
-        del log["parsed_date"]
-    return logs
+            rows = _resultset_to_rows(_stats("playergamelogs", params))
+            for r in rows[:last_n]:
+                logs[pid].append({
+                    "game_id": r.get("GAME_ID"),
+                    "game_date": r.get("GAME_DATE"),
+                    "matchup": r.get("MATCHUP"),
+                    "wl": r.get("WL"),
+                    "mins": float(r.get("MIN", 0) or 0),
+                    "pts": float(r.get("PTS", 0) or 0),
+                    "reb": float(r.get("REB", 0) or 0),
+                    "ast": float(r.get("AST", 0) or 0),
+                    "3pm": float(r.get("FG3M", 0) or 0),
+                    "stl": float(r.get("STL", 0) or 0),
+                    "blk": float(r.get("BLK", 0) or 0),
+                    "tov": float(r.get("TOV", 0) or 0),
+                    "fga": float(r.get("FGA", 0) or 0),
+                    "fgm": float(r.get("FGM", 0) or 0),
+                    "fta": float(r.get("FTA", 0) or 0),
+                    "ftm": float(r.get("FTM", 0) or 0),
+                })
+        except Exception as e:
+            logger.warning("PlayerGameLogs failed for %s: %s", pid, e)
+            logs[pid] = []
+
+    return dict(logs)
