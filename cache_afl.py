@@ -1,6 +1,5 @@
 # cache_afl.py -- AFL data cache
-# Completely separate from NBA cache
-# NEVER uses synthetic player data - returns empty props if stats unavailable
+# No synthetic player data. Empty props is correct when stats unavailable.
 
 import logging
 import threading
@@ -49,7 +48,7 @@ class MainAFLCache:
 
         logger.info("=== AFL cache fetch start ===")
 
-        # -- Round fixtures --------------------------------------------------
+        # Fixture
         round_data = get_upcoming_round()
         games      = round_data.get("games", [])
         round_num  = round_data.get("round")
@@ -59,58 +58,42 @@ class MainAFLCache:
         logger.info("AFL Round %s: %d games (source: %s)", round_num, len(games), data_src)
 
         if not games:
-            logger.warning("No AFL games found -- returning empty result")
             return {
                 "round": round_num, "year": year, "games": [],
                 "picks": _empty_picks(), "legs": [], "props": [],
                 "ladder": [], "last_updated": _now(),
                 "legs_scored": 0, "props_scored": 0,
-                "message": "No upcoming round found",
+                "message": "No upcoming games found",
             }
 
-        # -- Ladder & tips ---------------------------------------------------
-        logger.info("Fetching AFL ladder...")
+        # Ladder & tips
         ladder = get_ladder(year)
+        tips   = get_squiggle_tips(year, round_num) if round_num else []
 
-        tips = []
-        if round_num:
-            tips = get_squiggle_tips(year, round_num)
-
-        # -- Game odds -------------------------------------------------------
-        logger.info("Fetching AFL game odds...")
+        # Game odds
         try:
             game_odds_map = fetch_afl_game_odds(games)
         except Exception as e:
             logger.warning("AFL game odds failed: %s", e)
             game_odds_map = {}
 
-        # -- Player season averages ------------------------------------------
-        # IMPORTANT: No synthetic fallback. Empty = no props. This is correct
-        # for a betting tool - fabricated stats produce misleading props.
-        logger.info("Fetching AFL player averages...")
+        # Player stats — real data only
         player_avgs = get_player_season_averages(year)
+        if not player_avgs:
+            logger.warning("Player stats unavailable — props will be empty this cycle")
 
-        if player_avgs:
-            logger.info("Player averages loaded: %d players", len(player_avgs))
-        else:
-            logger.warning(
-                "Player stats unavailable -- props will be empty this cycle. "
-                "This is correct behaviour; do not fall back to synthetic data."
-            )
-
-        # -- Team news -------------------------------------------------------
+        # Team news
         team_news = get_team_news(year, round_num)
 
-        # -- Player prop odds ------------------------------------------------
-        logger.info("Fetching AFL player prop odds...")
+        # Prop odds
         try:
-            events           = fetch_afl_events()
+            events            = fetch_afl_events()
             prop_odds_by_game = fetch_all_game_props(games, events)
         except Exception as e:
             logger.warning("AFL prop odds failed: %s", e)
             prop_odds_by_game = {}
 
-        # -- Score each game -------------------------------------------------
+        # Score each game
         playing_teams  = set()
         all_legs       = []
         all_props      = []
@@ -122,30 +105,28 @@ class MainAFLCache:
             if home: playing_teams.add(home)
             if away: playing_teams.add(away)
 
-            venue      = get_venue_stats(game.get("venue", ""))
-            h2h        = get_h2h_history(home, away, year) if home and away else []
-            home_news  = team_news.get(home, {})
-            away_news  = team_news.get(away, {})
-            game_odds  = game_odds_map.get(game["game_id"], {})
+            venue     = get_venue_stats(game.get("venue", ""))
+            h2h       = get_h2h_history(home, away, year) if home and away else []
+            home_news = team_news.get(home, {})
+            away_news = team_news.get(away, {})
+            game_odds = game_odds_map.get(game["game_id"], {})
 
             enriched = {
-                **game,
-                **game_odds,
-                "venue_stats":   venue,
-                "home_news":     home_news,
-                "away_news":     away_news,
-                "ladder_home":   next((t for t in ladder if t["team"] == home), {}),
-                "ladder_away":   next((t for t in ladder if t["team"] == away), {}),
-                "squiggle_tip":  next(
+                **game, **game_odds,
+                "venue_stats":  venue,
+                "home_news":    home_news,
+                "away_news":    away_news,
+                "ladder_home":  next((t for t in ladder if t["team"] == home), {}),
+                "ladder_away":  next((t for t in ladder if t["team"] == away), {}),
+                "squiggle_tip": next(
                     (t for t in tips if
-                        (t["home_team"] == home and t["away_team"] == away) or
-                        (t["home_team"] == away and t["away_team"] == home)),
-                    {}
+                     (t["home_team"] == home and t["away_team"] == away) or
+                     (t["home_team"] == away and t["away_team"] == home)), {}
                 ),
             }
             enriched_games.append(enriched)
 
-            # Score game lines
+            # Game line scoring
             try:
                 ctx = build_game_context(
                     game=game, team_stats={}, ladder=ladder,
@@ -156,19 +137,15 @@ class MainAFLCache:
                 lean        = line_result.get("lean_team", home)
                 home_odds   = game_odds.get("home_odds", 1.90)
                 away_odds   = game_odds.get("away_odds", 1.90)
-                leg_odds    = home_odds if lean == home else away_odds
-
                 all_legs.append({
                     **line_result,
                     "game_id":   game["game_id"],
                     "game":      f"{away} @ {home}",
                     "selection": lean,
-                    "odds":      leg_odds or 1.90,
+                    "odds":      (home_odds if lean == home else away_odds) or 1.90,
                     "sport":     "AFL",
                 })
-
-                # Total leg
-                total_line = game_odds.get("total_line") or venue.get("avg_total", 157)
+                total_line   = game_odds.get("total_line") or venue.get("avg_total", 157)
                 total_result = score_afl_total(ctx)
                 if total_result:
                     direction = total_result.get("lean_direction", "Over")
@@ -181,27 +158,24 @@ class MainAFLCache:
                         "sport":     "AFL",
                     })
             except Exception as e:
-                logger.warning("AFL game scoring failed %s: %s", game.get("game_id"), e)
+                logger.warning("Game scoring failed %s: %s", game.get("game_id"), e)
 
-            # -- Player props (only if we have real stats) -------------------
+            # Props — skip entirely if no real stats
             if not player_avgs:
-                continue  # Skip props entirely rather than use fake data
+                continue
 
             game_prop_odds = prop_odds_by_game.get(game["game_id"], {})
 
             for is_home, team_name in [(True, home), (False, away)]:
                 news = home_news if is_home else away_news
-
                 team_players = {
                     n: p for n, p in player_avgs.items()
                     if p.get("team") == team_name and p.get("games", 0) >= 3
                 }
-
                 if not team_players:
-                    logger.debug("No real player data for %s -- skipping props", team_name)
+                    logger.debug("No player data for %s", team_name)
                     continue
 
-                # Take top 22 by disposals (same as a typical selection)
                 sorted_players = sorted(
                     team_players.items(),
                     key=lambda x: x[1].get("disposals", 0),
@@ -211,7 +185,7 @@ class MainAFLCache:
                 for pname, pdata in sorted_players:
                     real_lines = game_prop_odds.get(pname, {})
                     try:
-                        syn_logs = _synthetic_logs(pdata, n=12)
+                        syn_logs = _variance_logs(pdata, n=12)
                         result = project_afl_player_props(
                             player=pdata,
                             game_logs=syn_logs,
@@ -231,11 +205,11 @@ class MainAFLCache:
                                     "sport":   "AFL",
                                 })
                     except Exception as e:
-                        logger.warning("AFL props failed %s: %s", pname, e)
+                        logger.debug("Props failed %s: %s", pname, e)
 
-        logger.info("AFL: %d game legs, %d props scored", len(all_legs), len(all_props))
+        logger.info("AFL: %d legs, %d props", len(all_legs), len(all_props))
 
-        # -- Build multis from top props + game legs -------------------------
+        # Build multis
         top_prop_legs = []
         for p in sorted(
             [p for p in all_props if p.get("confidence", 0) >= 58],
@@ -243,50 +217,41 @@ class MainAFLCache:
         )[:8]:
             sel = f"{p['player']} {p['direction']} {p['book_line']} {p['stat_label']}"
             top_prop_legs.append({
-                "game_id":         p["game_id"],
-                "game":            p["game"],
-                "type":            f"Prop - {p['stat_label']}",
-                "selection":       sel,
-                "odds":            p.get("odds", 1.91),
-                "confidence":      p["confidence"],
-                "prob":            p["prob"],
-                "tags":            p.get("tags", []),
-                "reasoning":       p.get("reasoning", ""),
-                "factors":         [],
-                "projected_margin": None,
-                "projected_total": None,
-                "edge":            p.get("edge"),
-                "sport":           "AFL",
+                "game_id": p["game_id"], "game": p["game"],
+                "type": f"Prop - {p['stat_label']}", "selection": sel,
+                "odds": p.get("odds", 1.91), "confidence": p["confidence"],
+                "prob": p["prob"], "tags": p.get("tags", []),
+                "reasoning": p.get("reasoning", ""), "factors": [],
+                "projected_margin": None, "projected_total": None,
+                "edge": p.get("edge"), "sport": "AFL",
             })
 
         picks = build_afl_multis(all_legs + top_prop_legs)
         all_props.sort(key=lambda x: x.get("confidence", 0), reverse=True)
 
         return {
-            "round":          round_num,
-            "year":           year,
-            "games":          enriched_games,
-            "legs":           all_legs,
-            "props":          all_props,
-            "picks":          picks,
-            "ladder":         ladder,
-            "tips":           tips,
-            "last_updated":   _now(),
-            "legs_scored":    len(all_legs),
-            "props_scored":   len(all_props),
-            "data_source":    data_src,
+            "round":           round_num,
+            "year":            year,
+            "games":           enriched_games,
+            "legs":            all_legs,
+            "props":           all_props,
+            "picks":           picks,
+            "ladder":          ladder,
+            "tips":            tips,
+            "last_updated":    _now(),
+            "legs_scored":     len(all_legs),
+            "props_scored":    len(all_props),
+            "data_source":     data_src,
             "has_player_data": bool(player_avgs),
-            # Store for streak engine - only real data
-            "_player_avgs":   player_avgs,
-            "_playing_teams": playing_teams,
+            "_player_avgs":    player_avgs,
+            "_playing_teams":  playing_teams,
         }
 
 
-def _synthetic_logs(pdata: dict, n: int = 12) -> list:
+def _variance_logs(pdata: dict, n: int = 12) -> list:
     """
-    Generate variance logs from real season averages.
-    Used ONLY for projection math - NOT for fabricating player identities.
-    pdata must come from a real data source.
+    Generate variance logs from REAL season averages for projection math.
+    pdata must be real scraped data — this is NOT a synthetic player generator.
     """
     import random
     base = {
@@ -301,19 +266,16 @@ def _synthetic_logs(pdata: dict, n: int = 12) -> list:
         "fantasy_pts": pdata.get("fantasy_pts", 0),
     }
     stds = {
-        "disposals": 5.5, "kicks": 3.8, "handballs": 3.5,
-        "marks": 2.5, "goals": 1.4, "tackles": 2.0,
-        "clearances": 2.5, "hitouts": 4.5, "fantasy_pts": 22.0,
+        "disposals": 5.5, "kicks": 3.8, "handballs": 3.5, "marks": 2.5,
+        "goals": 1.4, "tackles": 2.0, "clearances": 2.5,
+        "hitouts": 4.5, "fantasy_pts": 22.0,
     }
     logs = []
     for _ in range(n):
         log = {}
         for stat, avg in base.items():
-            if avg <= 0:
-                log[stat] = 0
-                continue
             sd  = stds.get(stat, 3.0)
-            val = avg + random.gauss(0, sd)
+            val = avg + random.gauss(0, sd) if avg > 0 else 0
             log[stat] = max(0, round(val, 1))
         logs.append(log)
     return logs
@@ -330,47 +292,36 @@ class AFLStreakCache:
         with self._lock:
             age   = (datetime.now() - self._last_refresh).seconds if self._last_refresh else 9999
             stale = age > AFL_STREAK_TTL or not self._last_refresh
-            should_refresh = (force_refresh or stale) and not self._loading
-            if should_refresh:
-                self._trigger_refresh()
+            if (force_refresh or stale) and not self._loading:
+                self._loading = True
+                import threading
+                threading.Thread(target=self._background_fetch, daemon=True).start()
 
         with self._lock:
             return {
                 "streaks":      self._data,
                 "loading":      self._loading,
-                "last_updated": (
-                    self._last_refresh.strftime("%I:%M %p") if self._last_refresh else None
-                ),
+                "last_updated": self._last_refresh.strftime("%I:%M %p") if self._last_refresh else None,
             }
-
-    def _trigger_refresh(self):
-        with self._lock:
-            if self._loading:
-                return
-            self._loading = True
-        t = threading.Thread(target=self._background_fetch, daemon=True)
-        t.start()
 
     def _background_fetch(self):
         try:
             from afl_streak_engine import calculate_afl_streaks
-
             main_data     = afl_cache.get()
             player_avgs   = main_data.get("_player_avgs", {})
             playing_teams = main_data.get("_playing_teams", set())
 
             if not player_avgs:
-                logger.warning("AFL streak: no real player data available -- skipping")
+                logger.warning("AFL streaks: no real player data — skipping")
                 with self._lock:
                     self._loading = False
                 return
 
-            # Build variance logs from real averages for streak calculation
-            player_logs = {}
-            for name, pdata in player_avgs.items():
-                if pdata.get("team") in playing_teams:
-                    player_logs[name] = _synthetic_logs(pdata, n=15)
-
+            player_logs = {
+                name: _variance_logs(pdata, n=15)
+                for name, pdata in player_avgs.items()
+                if pdata.get("team") in playing_teams
+            }
             streaks = calculate_afl_streaks(
                 players=player_avgs,
                 player_logs=player_logs,
@@ -378,12 +329,10 @@ class AFLStreakCache:
                 windows=[5, 10, 15],
             )
             logger.info("AFL streaks: %d calculated", len(streaks))
-
             with self._lock:
                 self._data         = streaks
                 self._last_refresh = datetime.now()
                 self._loading      = False
-
         except Exception as e:
             logger.error("AFL streak fetch failed: %s", e)
             with self._lock:
@@ -393,9 +342,9 @@ class AFLStreakCache:
 def _empty_picks():
     e = {"legs": [], "odds": "N/A", "hitProb": 0, "risks": [], "alts": []}
     return {
-        "safe":  {**e, "key": "safe",  "label": "Safe Multi",  "accentColor": "#4CAF7D", "subtitle": "No round data"},
-        "mid":   {**e, "key": "mid",   "label": "Mid-Risk Multi", "accentColor": "#C9A84C", "subtitle": "No round data"},
-        "lotto": {**e, "key": "lotto", "label": "Lotto Multi", "accentColor": "#E05252", "subtitle": "No round data"},
+        "safe":  {**e, "key": "safe",  "label": "Safe Multi",     "accentColor": "#4CAF7D", "subtitle": "No round data"},
+        "mid":   {**e, "key": "mid",   "label": "Mid-Risk Multi",  "accentColor": "#C9A84C", "subtitle": "No round data"},
+        "lotto": {**e, "key": "lotto", "label": "Lotto Multi",     "accentColor": "#E05252", "subtitle": "No round data"},
     }
 
 
