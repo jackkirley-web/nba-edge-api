@@ -1,4 +1,4 @@
-# nba_data.py — NBA.com data with direct HTTP to bypass cloud IP blocking
+# nba_data.py - NBA.com data with direct HTTP to bypass cloud IP blocking
 
 # 
 
@@ -23,7 +23,7 @@ ESPN_BASE = “https://site.api.espn.com/apis/site/v2/sports/basketball/nba”
 NBA_CDN   = “https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json”
 NBA_STATS = “https://stats.nba.com/stats”
 
-# ── Shared session with browser headers ───────────────────────────────────────
+# – Shared session with browser headers —————————————
 
 _session = None
 
@@ -51,7 +51,7 @@ _session.headers.update({
 })
 return _session
 
-def _fetch_stats(endpoint: str, params: dict, retries: int = 3) -> dict | None:
+def _fetch_stats(endpoint: str, params: dict, retries: int = 3) -> dict:
 “”“Direct HTTP request to stats.nba.com with browser headers.”””
 session = _get_session()
 url = f”{NBA_STATS}/{endpoint}”
@@ -103,7 +103,7 @@ if attempt < retries - 1:
 time.sleep(2 ** attempt)
 return None
 
-# ── Schedule / Games ──────────────────────────────────────────────────────────
+# – Schedule / Games –––––––––––––––––––––––––––––
 
 def get_today_games():
 today = date.today()
@@ -202,10 +202,10 @@ except Exception as e:
 logger.error(“NBA CDN schedule fetch failed: %s”, e)
 return []
 
-# ── Team stats ────────────────────────────────────────────────────────────────
+# – Team stats ––––––––––––––––––––––––––––––––
 
 def get_all_team_stats_batch(measure_type=“Advanced”, location=None, last_n=None):
-“”“Fetch stats for all 30 teams — direct HTTP first, nba_api fallback.”””
+“”“Fetch stats for all 30 teams - direct HTTP first, nba_api fallback.”””
 
 ```
 params = {
@@ -293,10 +293,10 @@ return {}
 def get_all_team_recent_batch(last_n: int):
 return get_all_team_stats_batch(“Base”, last_n=last_n)
 
-# ── Player advanced stats ─────────────────────────────────────────────────────
+# – Player advanced stats —————————————————–
 
 def get_all_player_stats_batch():
-“”“Get player advanced stats for all players — direct HTTP first.”””
+“”“Get player advanced stats for all players - direct HTTP first.”””
 params = {
 “Season”:          CURRENT_SEASON,
 “SeasonType”:      SEASON_TYPE,
@@ -369,7 +369,7 @@ except Exception as e:
 logger.warning(”_player_adv_stats_nba_api failed: %s”, e)
 return {}
 
-# ── H2H history ───────────────────────────────────────────────────────────────
+# – H2H history —————————————————————
 
 def get_h2h_history(team_id: int, opponent_id: int):
 from nba_api.stats.endpoints import leaguegamefinder
@@ -399,7 +399,7 @@ except Exception:
 continue
 return all_games
 
-# ── ID mapping ────────────────────────────────────────────────────────────────
+# – ID mapping ––––––––––––––––––––––––––––––––
 
 ABBREV_TO_NBA_ID = {
 “ATL”: 1610612737, “BOS”: 1610612738, “BKN”: 1610612751,
