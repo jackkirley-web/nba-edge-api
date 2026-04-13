@@ -3,3 +3,4 @@ uvicorn[standard]
 nba_api
 pdfplumber
 requests
+beautifulsoup4>=4.12.0
