@@ -1,4 +1,4 @@
-# player_logs.py — Fetches per-player game logs from NBA.com
+# player_logs.py - Fetches per-player game logs from NBA.com
 
 # 
 
@@ -20,9 +20,9 @@ logger = logging.getLogger(**name**)
 CURRENT_SEASON = “2025-26”
 SEASON_TYPE    = “Regular Season”
 
-# ── Headers that mimic a real browser ─────────────────────────────────────────
+# – Headers that mimic a real browser —————————————–
 
-# These are what worked before — full Chrome UA with all NBA.com-expected headers
+# These are what worked before - full Chrome UA with all NBA.com-expected headers
 
 def _get_headers():
 return {
@@ -57,7 +57,7 @@ _session = requests.Session()
 _session.headers.update(_get_headers())
 return _session
 
-def _fetch_direct(endpoint: str, params: dict, retries: int = 3) -> dict | None:
+def _fetch_direct(endpoint: str, params: dict, retries: int = 3) -> dict:
 “””
 Make a direct HTTP request to stats.nba.com with browser headers.
 Retries with backoff on failure.
@@ -68,7 +68,7 @@ url = f”{NBA_STATS_BASE}/{endpoint}”
 ```
 for attempt in range(retries):
     try:
-        # Random delay to avoid rate limiting — longer on retries
+        # Random delay to avoid rate limiting - longer on retries
         delay = 0.6 + random.uniform(0, 0.4) + (attempt * 1.5)
         time.sleep(delay)
 
@@ -80,7 +80,7 @@ for attempt in range(retries):
             return data
 
         if resp.status_code == 429:
-            # Rate limited — wait longer
+            # Rate limited - wait longer
             logger.warning("Rate limited by NBA.com, waiting 10s...")
             time.sleep(10)
             continue
@@ -128,7 +128,7 @@ except Exception as e:
 logger.warning(“Failed to parse NBA response: %s”, e)
 return []
 
-# ── Game log fetching ──────────────────────────────────────────────────────────
+# – Game log fetching –––––––––––––––––––––––––––––
 
 def get_player_game_logs_batch(player_ids: list, last_n: int = 15) -> dict:
 “””
@@ -148,7 +148,7 @@ for i, player_id in enumerate(player_ids):
     # If we've had 10 consecutive failures, NBA.com is probably blocking us
     if consecutive_failures >= 10:
         logger.warning(
-            "10 consecutive failures — NBA.com is blocking this session. "
+            "10 consecutive failures - NBA.com is blocking this session. "
             "Got %d/%d players before block.", len(results), total
         )
         break
@@ -231,7 +231,7 @@ except Exception as e:
 logger.warning(“nba_api fallback failed for player %d: %s”, player_id, e)
 return []
 
-def _map_game_log_row(row: dict) -> dict | None:
+def _map_game_log_row(row: dict) -> dict:
 “”“Map a raw NBA.com API row to our game log format.”””
 try:
 raw_date = str(row.get(“GAME_DATE”, “”) or “”)
@@ -253,7 +253,7 @@ return {
 except Exception:
 return None
 
-# ── Player base stats ──────────────────────────────────────────────────────────
+# – Player base stats –––––––––––––––––––––––––––––
 
 def get_all_player_base_stats() -> dict:
 “””
