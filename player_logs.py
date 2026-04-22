@@ -14,7 +14,7 @@ from nba_api.stats.endpoints import leaguedashplayerstats
 logger = logging.getLogger(__name__)
 
 CURRENT_SEASON = "2025-26"
-SEASON_TYPE    = "Regular Season"
+SEASON_TYPE    = "Playoffs"
 
 # -- Headers that mimic a real browser -----------------------------------------
 # These are what worked before - full Chrome UA with all NBA.com-expected headers
