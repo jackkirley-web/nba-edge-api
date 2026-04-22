@@ -1,533 +1,227 @@
-# greyhound_data.py -- Australian greyhound data
-# Primary: TAB.com.au internal API (JSON, no auth required, cloud-friendly)
-# The TAB website uses this API itself - returns races, runners, form, odds
+# greyhound_data.py -- Australian greyhound racing data
+# Source: Ladbrokes Affiliates API (api-affiliates.ladbrokes.com.au)
+# Documented at https://nedscode.github.io/affiliate-feeds/
+# Free, no auth - just identifying headers required
+# Returns meetings, races, runners, form, odds in JSON
 
-import logging
-import time
-import random
-import requests
-from datetime import datetime, date, timezone, timedelta
+import logging, time, random, re, requests
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
-
-# TAB uses Venue-based API endpoints that are publicly accessible
-TAB_BASE = "https://api.tab.com.au/v1/tab-info-service"
-TAB_RACING = "https://api.tab.com.au/v1/tab-info-service/racing"
-
+LADBROKE_BASE = "https://api-affiliates.ladbrokes.com.au/affiliates/v1"
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-AU,en;q=0.9",
-    "Referer": "https://www.tab.com.au/",
-    "Origin": "https://www.tab.com.au",
+    "From": "sportedge@sportedge.app",
+    "X-Partner": "SportEdge Racing Intelligence",
+    "Accept": "application/json",
+    "User-Agent": "SportEdge/1.0",
 }
 
-# State jurisdictions for TAB
-JURISDICTIONS = ["NSW", "VIC", "QLD", "SA", "WA", "TAS", "ACT", "NT"]
-
-
-def _get(url, params=None, timeout=20):
+def _get(path, params=None, timeout=20):
+    url = LADBROKE_BASE + path
     for attempt in range(3):
         try:
-            time.sleep(0.6 + random.uniform(0, 0.3) + attempt * 1.0)
+            time.sleep(0.5 + random.uniform(0, 0.3) + attempt * 1.0)
             r = requests.get(url, params=params or {}, headers=HEADERS, timeout=timeout)
             if r.status_code == 200 and r.content:
                 return r.json()
-            logger.warning("TAB API %s returned %d (attempt %d)", url, r.status_code, attempt + 1)
+            logger.warning("Ladbrokes API %s -> %d (attempt %d)", path, r.status_code, attempt+1)
         except Exception as e:
-            logger.warning("TAB API %s failed attempt %d: %s", url, attempt + 1, e)
+            logger.warning("Ladbrokes API %s attempt %d: %s", path, attempt+1, e)
     return None
 
-
 def get_today_meetings() -> list:
-    """
-    Fetch all today's AU greyhound meetings from TAB API.
-    Returns list of meeting dicts with races and runners.
-    """
-    # Get AEST date (UTC+10)
     aest = datetime.now(timezone(timedelta(hours=10)))
     date_str = aest.strftime("%Y-%m-%d")
-
-    logger.info("Fetching greyhound meetings for %s AEST", date_str)
-
-    # TAB meetings endpoint
-    data = _get(f"{TAB_RACING}/meetings/greyhound/{date_str}", params={"jurisdiction": "NSW"})
-
+    logger.info("Fetching AU greyhound meetings for %s AEST", date_str)
+    data = _get("/racing/meetings", params={
+        "category": "G", "country": "AUS",
+        "date_from": date_str, "date_to": date_str, "limit": 200,
+    })
     if not data:
-        # Try alternate endpoint format
-        data = _get(f"{TAB_BASE}/racing/meetings", params={
-            "raceType": "G",
-            "date": date_str,
-        })
-
-    if not data:
-        # Try the race card endpoint
-        data = _get("https://api.tab.com.au/v1/tab-info-service/racing/meetings/G", params={
-            "date": date_str,
-            "jurisdiction": "NSW",
-        })
-
-    if not data:
-        logger.warning("TAB API unavailable, trying alternative sources")
-        return _get_meetings_alternative(date_str)
-
-    return _parse_tab_meetings(data, date_str)
-
-
-def _get_meetings_alternative(date_str: str) -> list:
-    """
-    Alternative sources when TAB API fails.
-    Tries Sportsbet and Racing.com public APIs.
-    """
-    # Try Racing.com (Australian racing aggregator - publicly accessible JSON)
-    try:
-        r = requests.get(
-            "https://www.racing.com/racing/api/meetings",
-            params={"date": date_str, "type": "G"},
-            headers=HEADERS,
-            timeout=15,
-        )
-        if r.status_code == 200 and r.content:
-            return _parse_racingcom_meetings(r.json(), date_str)
-    except Exception as e:
-        logger.warning("Racing.com failed: %s", e)
-
-    # Try Sportsbet internal API
-    try:
-        r = requests.get(
-            "https://www.sportsbet.com.au/apigw/racing-service/v2/meetings",
-            params={"date": date_str, "type": "Greyhound Racing"},
-            headers={**HEADERS, "Referer": "https://www.sportsbet.com.au/"},
-            timeout=15,
-        )
-        if r.status_code == 200 and r.content:
-            return _parse_sportsbet_meetings(r.json(), date_str)
-    except Exception as e:
-        logger.warning("Sportsbet API failed: %s", e)
-
-    # Last resort - try Ladbrokes
-    try:
-        r = requests.get(
-            "https://www.ladbrokes.com.au/api/racing/meetings",
-            params={"date": date_str, "sportCode": "G"},
-            headers={**HEADERS, "Referer": "https://www.ladbrokes.com.au/"},
-            timeout=15,
-        )
-        if r.status_code == 200 and r.content:
-            return _parse_generic_meetings(r.json(), date_str, "Ladbrokes")
-    except Exception as e:
-        logger.warning("Ladbrokes API failed: %s", e)
-
-    logger.error("All greyhound data sources failed for %s", date_str)
-    return []
-
-
-def _parse_tab_meetings(data, date_str: str) -> list:
-    """Parse TAB API meeting response."""
+        logger.error("Ladbrokes API: no response")
+        return []
+    raw = data.get("data", {}).get("meetings", [])
+    logger.info("Ladbrokes: %d raw greyhound meetings", len(raw))
     meetings = []
-
-    # TAB returns meetings in various structures
-    raw_meetings = (
-        data if isinstance(data, list) else
-        data.get("meetings", []) or
-        data.get("data", {}).get("meetings", []) or
-        []
-    )
-
-    for m in raw_meetings:
+    for m in raw:
         try:
-            track = (
-                m.get("meetingName") or
-                m.get("venueName") or
-                m.get("name") or ""
-            ).strip()
-
-            state = (
-                m.get("location") or
-                m.get("state") or
-                m.get("jurisdiction") or
-                _guess_state(track)
-            ).upper()
-
-            condition = _parse_condition(
-                m.get("trackCondition") or m.get("condition") or "Good"
-            )
-
-            # Get races
-            raw_races = m.get("races", []) or m.get("events", []) or []
-            races = []
-            for race_data in raw_races:
-                race = _parse_tab_race(race_data, track, condition)
-                if race and race.get("runners"):
-                    races.append(race)
-
-            if not races:
-                # Fetch races separately if not included
-                meeting_id = m.get("meetingId") or m.get("id")
-                if meeting_id:
-                    races = _fetch_meeting_races(meeting_id, track, condition, date_str)
-
-            if races:
-                meetings.append({
-                    "track":           track,
-                    "state":           state,
-                    "condition":       condition,
-                    "date":            date_str,
-                    "races":           races,
-                    "meeting_id":      m.get("meetingId") or m.get("id"),
-                })
-
+            parsed = _parse_meeting(m, date_str)
+            if parsed and parsed.get("races"):
+                meetings.append(parsed)
         except Exception as e:
-            logger.warning("Failed to parse TAB meeting: %s", e)
-
-    logger.info("Parsed %d meetings from TAB API", len(meetings))
+            logger.warning("Meeting parse error %s: %s", m.get("name"), e)
+    logger.info("Parsed %d meetings with races", len(meetings))
     return meetings
 
-
-def _parse_tab_race(race_data: dict, track: str, condition: str) -> dict:
-    """Parse a single race from TAB data."""
-    try:
-        race_num = int(race_data.get("raceNumber") or race_data.get("number") or 0)
-        if race_num == 0:
-            return {}
-
-        # Race time
-        start_time = race_data.get("raceStartTime") or race_data.get("startTime") or ""
-        race_time = ""
-        if start_time:
-            try:
-                dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
-                aest = dt.astimezone(timezone(timedelta(hours=10)))
-                race_time = aest.strftime("%-I:%M %p")
-            except Exception:
-                race_time = start_time[:5] if len(start_time) >= 5 else start_time
-
-        # Distance
-        distance = None
-        dist_raw = race_data.get("distance") or race_data.get("raceDistance")
-        if dist_raw:
-            try:
-                distance = int(str(dist_raw).replace("m", "").strip())
-            except Exception:
-                pass
-
-        # Grade
-        grade = (
-            race_data.get("raceClassConditions") or
-            race_data.get("grade") or
-            race_data.get("raceClass") or ""
-        ).strip()
-
-        # Parse runners
-        runners = []
-        raw_runners = race_data.get("runners") or race_data.get("entrants") or []
-        for r in raw_runners:
-            runner = _parse_tab_runner(r)
-            if runner:
-                runners.append(runner)
-
-        if not runners:
-            return {}
-
-        return {
-            "race_num":  race_num,
-            "race_time": race_time,
-            "distance":  distance,
-            "grade":     grade,
-            "condition": condition,
-            "track":     track,
-            "runners":   runners,
-        }
-
-    except Exception as e:
-        logger.warning("Failed to parse TAB race: %s", e)
-        return {}
-
-
-def _parse_tab_runner(r: dict) -> dict:
-    """Parse a single runner from TAB data."""
-    try:
-        name = (
-            r.get("runnerName") or
-            r.get("name") or
-            r.get("dogName") or ""
-        ).strip()
-
-        if not name:
-            return {}
-
-        box = None
-        box_raw = r.get("barrierNumber") or r.get("tabNo") or r.get("number")
-        if box_raw:
-            try:
-                box = int(box_raw)
-            except Exception:
-                pass
-
-        if not box:
-            return {}
-
-        trainer = (
-            r.get("trainerName") or
-            r.get("trainer", {}).get("name") or ""
-        ).strip()
-
-        # Scratchings
-        scratched = (
-            r.get("isScratched") or
-            r.get("scratched") or
-            r.get("status", "").lower() in ("scratched", "scr", "s")
-        )
-
-        # Form string (last 5 results)
-        form_str = r.get("form") or r.get("last5Starts") or r.get("formSummary") or ""
-
-        # Odds
-        odds = None
-        odds_raw = (
-            r.get("fixedOdds", {}).get("returnWin") or
-            r.get("winPrice") or
-            r.get("price")
-        )
-        if odds_raw:
-            try:
-                odds = float(odds_raw)
-            except Exception:
-                pass
-
-        # Parse last 5 positions from form string
-        last_5 = _parse_form_string(form_str)
-
-        # Track/distance stats
-        track_wins    = _safe_int(r.get("trackWins") or r.get("trackWin"))
-        track_starts  = _safe_int(r.get("trackStarts") or r.get("trackStart"))
-        dist_wins     = _safe_int(r.get("distanceWins") or r.get("distanceWin"))
-        dist_starts   = _safe_int(r.get("distanceStarts") or r.get("distanceStart"))
-        career_wins   = _safe_int(r.get("careerWins") or r.get("wins"))
-        career_starts = _safe_int(r.get("careerStarts") or r.get("starts"))
-
-        return {
-            "box":            box,
-            "name":           name,
-            "trainer":        trainer,
-            "form_str":       form_str,
-            "last_5":         last_5,
-            "odds":           odds,
-            "track_wins":     track_wins,
-            "track_starts":   track_starts,
-            "dist_wins":      dist_wins,
-            "dist_starts":    dist_starts,
-            "career_wins":    career_wins,
-            "career_starts":  career_starts,
-            "scratched":      bool(scratched),
-        }
-
-    except Exception as e:
-        logger.warning("Failed to parse TAB runner: %s", e)
-        return {}
-
-
-def _fetch_meeting_races(meeting_id, track, condition, date_str) -> list:
-    """Fetch races for a specific meeting ID."""
-    data = _get(f"{TAB_RACING}/meetings/G/{meeting_id}/races", params={"date": date_str})
-    if not data:
-        return []
-    raw_races = data if isinstance(data, list) else data.get("races", [])
+def _parse_meeting(m: dict, date_str: str) -> dict:
+    track = m.get("name", "").strip()
+    state = m.get("state", _guess_state(track)).upper()
+    condition = "Good"
+    raw_races = m.get("races", [])
     races = []
-    for race_data in raw_races:
-        race = _parse_tab_race(race_data, track, condition)
+    for stub in raw_races:
+        race_id = stub.get("id")
+        if not race_id:
+            continue
+        full = _fetch_race(race_id)
+        if not full:
+            continue
+        if condition == "Good" and full.get("track_condition"):
+            condition = _parse_condition(full["track_condition"])
+        race = _parse_race(full, stub, track, condition)
         if race and race.get("runners"):
             races.append(race)
-    return races
+    return {"track": track, "state": state, "condition": condition, "date": date_str, "races": races} if races else {}
 
+def _fetch_race(race_id: str) -> dict:
+    data = _get(f"/racing/events/{race_id}")
+    if not data:
+        return {}
+    d = data.get("data", {})
+    return d.get("race") or d.get("event") or (d if isinstance(d, dict) else {})
 
-def _parse_racingcom_meetings(data, date_str) -> list:
-    """Parse Racing.com API response."""
-    meetings = []
-    raw = data if isinstance(data, list) else data.get("meetings", [])
-    for m in raw:
+def _parse_race(full: dict, stub: dict, track: str, condition: str) -> dict:
+    race_num = int(stub.get("race_number") or full.get("race_number") or 0)
+    if not race_num:
+        return {}
+    start = stub.get("start_time") or full.get("start_time") or ""
+    race_time = ""
+    if start:
         try:
-            track = m.get("name") or m.get("venue") or ""
-            state = _guess_state(track)
-            condition = _parse_condition(m.get("condition") or "Good")
-            races = []
-            for rd in m.get("races", []):
-                race = _parse_tab_race(rd, track, condition)
-                if race and race.get("runners"):
-                    races.append(race)
-            if races:
-                meetings.append({
-                    "track": track, "state": state, "condition": condition,
-                    "date": date_str, "races": races,
-                })
-        except Exception as e:
-            logger.warning("Racing.com parse error: %s", e)
-    return meetings
+            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            race_time = dt.astimezone(timezone(timedelta(hours=10))).strftime("%-I:%M %p")
+        except Exception:
+            race_time = start[:5]
+    distance = int(stub.get("distance") or full.get("distance") or 0) or None
+    tc = full.get("track_condition") or stub.get("track_condition") or ""
+    if tc:
+        condition = _parse_condition(tc)
+    race_name = full.get("name") or stub.get("name") or ""
+    grade = _extract_grade(race_name)
+    raw_runners = full.get("entrants") or full.get("runners") or full.get("selections") or []
+    runners = [r for r in (_parse_runner(e) for e in raw_runners) if r]
+    runners.sort(key=lambda x: x.get("box", 99))
+    return {"race_num": race_num, "race_time": race_time, "distance": distance,
+            "grade": grade, "condition": condition, "track": track, "runners": runners} if runners else {}
 
+def _parse_runner(e: dict) -> dict:
+    name = (e.get("name") or e.get("runner_name") or e.get("entrant_name") or "").strip()
+    if not name:
+        return {}
+    box = None
+    for key in ("barrier_number", "box_number", "tab_number", "number", "position"):
+        v = e.get(key)
+        if v is not None:
+            try: box = int(v); break
+            except Exception: pass
+    if not box:
+        return {}
+    scratched = (e.get("is_scratched") or e.get("scratched") or
+                 str(e.get("status","")).lower() in ("scratched","scr","withdrawn"))
+    trainer_raw = e.get("trainer") or e.get("trainer_name") or {}
+    trainer = (trainer_raw.get("name","") if isinstance(trainer_raw, dict) else str(trainer_raw))
+    # Extract odds
+    odds = None
+    odds_raw = e.get("odds") or e.get("win_odds") or e.get("prices") or {}
+    if isinstance(odds_raw, dict):
+        for k in ("win","fixed_win","tote_win","returnWin","price","open"):
+            v = odds_raw.get(k)
+            if v:
+                try: odds = float(v); break
+                except Exception: pass
+    elif isinstance(odds_raw, (int, float)):
+        try: odds = float(odds_raw)
+        except Exception: pass
+    if odds and odds < 1.01:
+        odds = None
+    form_str = str(e.get("form") or e.get("last_starts") or e.get("form_guide") or "")
+    last_5 = _parse_form_string(form_str)
+    def _si(k): 
+        try: return int(float(str(e.get(k) or 0)))
+        except Exception: return 0
+    return {
+        "box": box, "name": name, "trainer": trainer,
+        "form_str": form_str, "last_5": last_5, "odds": odds,
+        "track_wins": _si("track_wins"), "track_starts": _si("track_starts"),
+        "dist_wins": _si("distance_wins"), "dist_starts": _si("distance_starts"),
+        "career_wins": _si("career_wins"), "career_starts": _si("career_starts"),
+        "scratched": bool(scratched),
+    }
 
-def _parse_sportsbet_meetings(data, date_str) -> list:
-    """Parse Sportsbet API response."""
-    meetings = []
-    raw = data if isinstance(data, list) else data.get("meetings", []) or data.get("data", [])
-    for m in raw:
-        try:
-            track = m.get("meetingName") or m.get("name") or ""
-            state = m.get("state") or _guess_state(track)
-            condition = _parse_condition(m.get("trackCondition") or "Good")
-            races = []
-            for rd in m.get("races", []) or m.get("events", []):
-                race = _parse_tab_race(rd, track, condition)
-                if race and race.get("runners"):
-                    races.append(race)
-            if races:
-                meetings.append({
-                    "track": track, "state": state, "condition": condition,
-                    "date": date_str, "races": races,
-                })
-        except Exception as e:
-            logger.warning("Sportsbet parse error: %s", e)
-    return meetings
-
-
-def _parse_generic_meetings(data, date_str, source) -> list:
-    """Generic parser for any bookmaker API structure."""
-    meetings = []
-    raw = data if isinstance(data, list) else (
-        data.get("meetings") or data.get("data") or data.get("results") or []
-    )
-    for m in raw:
-        try:
-            track = (m.get("meetingName") or m.get("name") or m.get("venue") or "").strip()
-            if not track:
-                continue
-            state = _guess_state(track)
-            condition = _parse_condition(m.get("trackCondition") or m.get("condition") or "Good")
-            raw_races = m.get("races") or m.get("events") or []
-            races = []
-            for rd in raw_races:
-                race = _parse_tab_race(rd, track, condition)
-                if race and race.get("runners"):
-                    races.append(race)
-            if races:
-                meetings.append({
-                    "track": track, "state": state, "condition": condition,
-                    "date": date_str, "races": races, "source": source,
-                })
-        except Exception as e:
-            logger.warning("%s parse error: %s", source, e)
-    return meetings
-
-
-# -- Form parsing -----------------------------------------------------------
-
-def _parse_form_string(form_str: str) -> list:
-    """Parse form string like '1-2-4-1-3' into list of int positions."""
-    if not form_str:
-        return []
-    import re
-    parts = re.split(r"[-.\s,]", str(form_str))
-    if len(parts) == 1:
-        parts = list(str(form_str))
-    positions = []
+def _parse_form_string(s: str) -> list:
+    if not s or s == "None": return []
+    parts = re.split(r"[-.\s,]", s)
+    if len(parts) == 1: parts = list(s)
+    out = []
     for p in parts:
         p = str(p).strip().upper()
-        if p in ("F", "D", "N", "X", "S"):
-            positions.append(8)
-        elif p.isdigit():
-            positions.append(int(p))
-    return positions[:5]
+        if p in ("F","D","N","X","S","E"): out.append(8)
+        elif p.isdigit(): out.append(int(p))
+    return out[:5]
 
+def _extract_grade(name: str) -> str:
+    if not name: return ""
+    for pat in [r"(Grade\s*\d+)",r"(Maiden)",r"(Free\s*For\s*All|FFA)",
+                r"(Restricted\s*Win)",r"(Open)",r"(Masters)",r"(Tier\s*\d+)"]:
+        m = re.search(pat, name, re.I)
+        if m: return m.group(1).strip()
+    return ""
 
 def _parse_condition(raw: str) -> str:
-    raw = str(raw).strip().title()
-    mapping = {
-        "Good": "Good", "Good 4": "Good", "Firm": "Good", "Fast": "Good",
-        "Soft": "Soft", "Soft 5": "Soft", "Soft 6": "Soft",
-        "Heavy": "Heavy", "Heavy 8": "Heavy", "Heavy 9": "Heavy", "Heavy 10": "Heavy",
-        "Wet": "Wet", "Rain Affected": "Wet",
-    }
-    return mapping.get(raw, "Good")
-
+    mapping = {"Good":"Good","Good 4":"Good","Firm":"Good","Fast":"Good",
+               "Soft":"Soft","Soft 5":"Soft","Heavy":"Heavy","Wet":"Wet","Rain Affected":"Wet"}
+    return mapping.get(str(raw).strip().title(), "Good")
 
 def _guess_state(track: str) -> str:
-    track_lower = track.lower()
-    vic = ["meadows", "sandown", "ballarat", "geelong", "warragul", "cranbourne",
-           "shepparton", "horsham", "bendigo", "traralgon", "sale", "healesville",
-           "hamilton", "mildura", "kilmore", "pakenham"]
-    nsw = ["wentworth", "richmond", "bathurst", "gosford", "tamworth", "gunnedah",
-           "nowra", "grafton", "lismore", "Newcastle", "dapto", "penrith"]
-    qld = ["albion", "ipswich", "capalaba", "townsville", "rockhampton", "logan",
-           "bundaberg", "toowoomba", "cairns", "mackay"]
-    sa  = ["angle park", "gawler", "murray bridge", "mount gambier"]
-    wa  = ["cannington", "mandurah", "northam", "albany"]
-    tas = ["launceston", "devonport", "hobart"]
-    nt  = ["darwin", "alice springs"]
-
-    for t in vic:
-        if t in track_lower: return "VIC"
-    for t in nsw:
-        if t in track_lower: return "NSW"
-    for t in qld:
-        if t in track_lower: return "QLD"
-    for t in sa:
-        if t in track_lower: return "SA"
-    for t in wa:
-        if t in track_lower: return "WA"
-    for t in tas:
-        if t in track_lower: return "TAS"
-    for t in nt:
-        if t in track_lower: return "NT"
+    t = track.lower()
+    for name in ["meadows","sandown","ballarat","geelong","warragul","cranbourne",
+                 "shepparton","horsham","bendigo","traralgon","sale","healesville"]:
+        if name in t: return "VIC"
+    for name in ["wentworth","richmond","bathurst","gosford","tamworth","gunnedah",
+                 "nowra","grafton","lismore","newcastle","dapto","penrith"]:
+        if name in t: return "NSW"
+    for name in ["albion","ipswich","capalaba","townsville","rockhampton","logan",
+                 "bundaberg","toowoomba","cairns","mackay"]:
+        if name in t: return "QLD"
+    for name in ["angle park","gawler","murray bridge","mount gambier"]:
+        if name in t: return "SA"
+    for name in ["cannington","mandurah","northam","albany"]:
+        if name in t: return "WA"
+    for name in ["launceston","devonport","hobart"]:
+        if name in t: return "TAS"
+    for name in ["darwin","alice springs"]:
+        if name in t: return "NT"
     return "AU"
 
-
-# -- Box advantage database -----------------------------------------------
-# Historical win % by box position for major AU greyhound tracks.
-
 BOX_WIN_PCT = {
-    "the meadows":  {525:{1:17.8,2:14.2,3:13.1,4:12.0,5:11.8,6:11.5,7:10.8,8:8.8}, 600:{1:16.5,2:13.5,3:12.5,4:12.0,5:12.0,6:11.5,7:11.0,8:11.0}},
-    "sandown park": {515:{1:18.2,2:14.5,3:13.0,4:12.0,5:11.5,6:11.0,7:10.5,8:9.3}, 595:{1:16.0,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:11.0,8:10.0}},
-    "ballarat":     {450:{1:18.5,2:14.8,3:13.2,4:12.0,5:11.0,6:10.5,7:10.0,8:10.0}, 520:{1:17.0,2:14.0,3:12.5,4:12.0,5:11.5,6:11.5,7:11.0,8:10.5}},
-    "geelong":      {400:{1:19.0,2:15.0,3:13.5,4:12.0,5:11.0,6:10.0,7:9.5,8:10.0},  520:{1:17.5,2:14.5,3:13.0,4:12.0,5:11.5,6:11.0,7:10.5,8:10.0}},
-    "warragul":     {390:{1:20.5,2:15.5,3:13.0,4:12.0,5:10.5,6:10.0,7:9.5,8:9.0},   450:{1:18.0,2:14.5,3:13.0,4:12.0,5:11.0,6:10.5,7:11.0,8:10.0}},
-    "cranbourne":   {311:{1:22.0,2:16.0,3:13.0,4:11.0,5:10.5,6:10.0,7:9.5,8:8.0},   520:{1:17.0,2:14.0,3:12.5,4:12.0,5:12.0,6:11.5,7:11.0,8:10.0}},
-    "wentworth park":{520:{1:17.5,2:14.0,3:13.0,4:12.5,5:12.0,6:11.0,7:10.5,8:9.5}, 720:{1:15.5,2:13.5,3:13.0,4:12.5,5:12.5,6:12.0,7:11.0,8:10.0}},
-    "albion park":  {520:{1:17.0,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:9.5},  600:{1:16.0,2:13.5,3:13.0,4:12.5,5:12.5,6:12.0,7:11.0,8:9.5}},
-    "angle park":   {520:{1:17.0,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:9.5},  595:{1:15.5,2:13.5,3:13.0,4:12.5,5:12.5,6:12.0,7:11.0,8:10.0}},
-    "cannington":   {520:{1:17.5,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:9.0},  642:{1:15.5,2:13.5,3:13.0,4:13.0,5:12.5,6:12.0,7:11.0,8:9.5}},
-    "ipswich":      {431:{1:19.0,2:15.0,3:13.0,4:12.0,5:11.0,6:10.5,7:10.0,8:9.5},  520:{1:17.0,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:9.5}},
-    "launceston":   {461:{1:19.0,2:15.0,3:13.0,4:12.0,5:11.0,6:10.5,7:10.0,8:9.5},  553:{1:16.5,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:10.0}},
-    "richmond":     {410:{1:19.5,2:15.5,3:13.0,4:12.0,5:11.0,6:10.0,7:9.5,8:9.5},   525:{1:17.0,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:9.5}},
-    "default":      {300:{1:22.0,2:16.0,3:13.0,4:11.0,5:10.0,6:9.5,7:9.0,8:9.5},
-                     400:{1:19.0,2:14.5,3:13.0,4:12.0,5:11.0,6:10.5,7:10.0,8:10.0},
-                     500:{1:17.5,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:9.0},
-                     600:{1:15.5,2:13.5,3:13.0,4:12.5,5:12.5,6:12.0,7:11.0,8:10.0},
-                     700:{1:14.5,2:13.5,3:13.0,4:13.0,5:12.5,6:12.5,7:11.5,8:9.5}},
+    "the meadows":   {525:{1:17.8,2:14.2,3:13.1,4:12.0,5:11.8,6:11.5,7:10.8,8:8.8},600:{1:16.5,2:13.5,3:12.5,4:12.0,5:12.0,6:11.5,7:11.0,8:11.0}},
+    "sandown park":  {515:{1:18.2,2:14.5,3:13.0,4:12.0,5:11.5,6:11.0,7:10.5,8:9.3},595:{1:16.0,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:11.0,8:10.0}},
+    "ballarat":      {450:{1:18.5,2:14.8,3:13.2,4:12.0,5:11.0,6:10.5,7:10.0,8:10.0},520:{1:17.0,2:14.0,3:12.5,4:12.0,5:11.5,6:11.5,7:11.0,8:10.5}},
+    "geelong":       {400:{1:19.0,2:15.0,3:13.5,4:12.0,5:11.0,6:10.0,7:9.5,8:10.0},520:{1:17.5,2:14.5,3:13.0,4:12.0,5:11.5,6:11.0,7:10.5,8:10.0}},
+    "warragul":      {390:{1:20.5,2:15.5,3:13.0,4:12.0,5:10.5,6:10.0,7:9.5,8:9.0},450:{1:18.0,2:14.5,3:13.0,4:12.0,5:11.0,6:10.5,7:11.0,8:10.0}},
+    "cranbourne":    {311:{1:22.0,2:16.0,3:13.0,4:11.0,5:10.5,6:10.0,7:9.5,8:8.0},520:{1:17.0,2:14.0,3:12.5,4:12.0,5:12.0,6:11.5,7:11.0,8:10.0}},
+    "wentworth park":{520:{1:17.5,2:14.0,3:13.0,4:12.5,5:12.0,6:11.0,7:10.5,8:9.5},720:{1:15.5,2:13.5,3:13.0,4:12.5,5:12.5,6:12.0,7:11.0,8:10.0}},
+    "albion park":   {520:{1:17.0,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:9.5},600:{1:16.0,2:13.5,3:13.0,4:12.5,5:12.5,6:12.0,7:11.0,8:9.5}},
+    "angle park":    {520:{1:17.0,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:9.5},595:{1:15.5,2:13.5,3:13.0,4:12.5,5:12.5,6:12.0,7:11.0,8:10.0}},
+    "cannington":    {520:{1:17.5,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:9.0},642:{1:15.5,2:13.5,3:13.0,4:13.0,5:12.5,6:12.0,7:11.0,8:9.5}},
+    "ipswich":       {431:{1:19.0,2:15.0,3:13.0,4:12.0,5:11.0,6:10.5,7:10.0,8:9.5},520:{1:17.0,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:9.5}},
+    "launceston":    {461:{1:19.0,2:15.0,3:13.0,4:12.0,5:11.0,6:10.5,7:10.0,8:9.5},553:{1:16.5,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:10.0}},
+    "richmond":      {410:{1:19.5,2:15.5,3:13.0,4:12.0,5:11.0,6:10.0,7:9.5,8:9.5},525:{1:17.0,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:9.5}},
+    "default":       {300:{1:22.0,2:16.0,3:13.0,4:11.0,5:10.0,6:9.5,7:9.0,8:9.5},400:{1:19.0,2:14.5,3:13.0,4:12.0,5:11.0,6:10.5,7:10.0,8:10.0},500:{1:17.5,2:14.0,3:13.0,4:12.5,5:12.0,6:11.5,7:10.5,8:9.0},600:{1:15.5,2:13.5,3:13.0,4:12.5,5:12.5,6:12.0,7:11.0,8:10.0},700:{1:14.5,2:13.5,3:13.0,4:13.0,5:12.5,6:12.5,7:11.5,8:9.5}},
 }
 
-
 def get_box_win_pct(track: str, distance: int, box: int) -> float:
-    track_key = track.lower().strip()
-    track_data = BOX_WIN_PCT.get(track_key)
-    if not track_data:
-        for key in BOX_WIN_PCT:
-            if key != "default" and (key in track_key or track_key in key):
-                track_data = BOX_WIN_PCT[key]
-                break
-    if not track_data:
-        track_data = BOX_WIN_PCT["default"]
-    distances = sorted(track_data.keys())
-    closest = min(distances, key=lambda d: abs(d - (distance or 520)))
-    return track_data.get(closest, {}).get(box, 12.5)
-
+    t = track.lower().strip()
+    td = BOX_WIN_PCT.get(t)
+    if not td:
+        for k in BOX_WIN_PCT:
+            if k != "default" and (k in t or t in k):
+                td = BOX_WIN_PCT[k]; break
+    if not td: td = BOX_WIN_PCT["default"]
+    dists = sorted(td.keys())
+    closest = min(dists, key=lambda d: abs(d - (distance or 520)))
+    return td.get(closest, {}).get(box, 12.5)
 
 WET_FACTOR = {"good":1.0,"fast":1.0,"soft":1.05,"heavy":1.12,"wet":1.10}
-
 def get_condition_factor(condition: str) -> float:
     return WET_FACTOR.get(condition.lower(), 1.0)
-
-
-def _safe_int(v) -> int:
-    try:
-        return int(v or 0)
-    except Exception:
-        return 0
