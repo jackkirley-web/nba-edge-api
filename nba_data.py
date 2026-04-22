@@ -13,7 +13,7 @@ from datetime import datetime, date
 logger = logging.getLogger(__name__)
 
 CURRENT_SEASON = "2025-26"
-SEASON_TYPE    = "Regular Season"
+SEASON_TYPE    = "Playoffs"
 
 ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba"
 NBA_CDN   = "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2.json"
